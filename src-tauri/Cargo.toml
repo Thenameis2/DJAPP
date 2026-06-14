@@ -1,0 +1,20 @@
+[package]
+name = "djapp-desktop"
+version = "0.1.0"
+description = "Offline-first macOS DJ application"
+edition = "2021"
+rust-version = "1.96"
+publish = false
+
+[lib]
+name = "djapp_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+djapp-audio-spike = { path = ".." }
+serde = { version = "1.0.228", features = ["derive"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2.7.1"

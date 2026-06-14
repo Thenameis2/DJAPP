@@ -1,0 +1,16 @@
+[package]
+name = "djapp-audio-spike"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+publish = false
+
+[dependencies]
+cpal = "0.18.1"
+rtrb = "0.3.4"
+rubato = { version = "3.0.0", default-features = true }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+symphonia = { version = "0.6.0", default-features = false, features = ["aac", "aiff", "flac", "id3v1", "id3v2", "isomp4", "mp3", "opt-simd-neon", "pcm", "wav"] }
+
+[profile.release]
+debug = 1
