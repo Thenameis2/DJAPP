@@ -1,6 +1,6 @@
 # ADR-011: Tempo, Pitch, Beat Sync, And Jog Control
 
-- Status: Accepted for architecture and isolated Signalsmith spike; production integration still requires owner approval
+- Status: Amended; vinyl-style manual rate accepted for testing, spectral key lock and pitch deferred
 - Date: 2026-06-15
 - Scope: Per-deck tempo and pitch processing, master/follower beat synchronization, pitch bend, and pointer-driven jog behavior
 
@@ -203,4 +203,12 @@ The owner approved this ADR and its isolated Signalsmith evaluation on 2026-06-1
 
 The approved Apple-silicon spike completed on 2026-06-15. `signalsmith-stretch` 0.1.3 built without patches, passed synthetic tempo and pitch checks, completed reset/flush stress, and processed two concurrent 30-minute stereo workloads with zero simulated buffered underflows. The default preset reports 120 ms total processor latency and is recommended over the 140 ms cheaper preset. Detailed measurements and remaining listening acceptance are recorded in `docs/testing/signalsmith-tempo-pitch-spike.md`.
 
-The dependency remains optional and feature-gated. This result recommends production integration behind `TempoProcessor`, but does not authorize it.
+The owner subsequently approved production integration. The first production slice now uses the default preset behind `TempoProcessor` for manual tempo, key lock, and independent pitch. Sync, pitch bend, jog behavior, BPM/beat-grid analysis, and listening-quality acceptance remain incomplete.
+
+## Production Approval
+
+The owner approved the recommended production `TempoProcessor` integration on 2026-06-15. The implementation and Apple M3 hardware results are documented in `docs/testing/production-tempo-pitch.md`.
+
+## 2026-06-15 Amendment: Varispeed Fallback
+
+Real-song testing repeatedly produced looping when the production deck entered Signalsmith processing, despite passing synthetic and generated music-like WAV/MP3/M4A diagnostics. The production manual-rate path therefore uses the project-owned interpolating varispeed fallback already evaluated in this ADR. Rate changes pitch naturally and add no processor latency. Key lock and independent pitch fail closed and are no longer claimed as completed. Signalsmith remains isolated for future investigation; it is not called by production rate commands.

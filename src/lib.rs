@@ -6,3 +6,4 @@ pub mod library;
 pub mod media;
 pub mod mixer;
 pub mod persistence;
+pub mod tempo;

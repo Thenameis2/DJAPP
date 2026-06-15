@@ -2,12 +2,12 @@
 
 ## Scope
 
-This spike evaluates `signalsmith-stretch` 0.1.3 on the target Apple M3 without connecting it to the production deck, mixer, Tauri, or UI paths. The dependency and binary are available only with the `signalsmith-spike` Cargo feature.
+This spike originally evaluated `signalsmith-stretch` 0.1.3 on the target Apple M3 without connecting it to production paths. Production integration was subsequently approved; this document preserves the isolated measurements.
 
 Run the complete synthetic evaluation with:
 
 ```sh
-cargo run --release --features signalsmith-spike --bin djapp-signalsmith-spike -- --soak-seconds 1800
+cargo run --release --bin djapp-signalsmith-spike -- --soak-seconds 1800
 ```
 
 ## Build Findings
@@ -15,7 +15,7 @@ cargo run --release --features signalsmith-spike --bin djapp-signalsmith-spike -
 - Target: arm64 Apple M3, macOS 26.4.1, Rust 1.96.
 - The wrapper compiled without patches using AppleClang, C++14, Bindgen, and the installed libclang.
 - The spike executable is a 677,336-byte arm64 Mach-O and dynamically links only system `libc++` and `libSystem`.
-- The optional feature adds 27 locked transitive build/runtime packages. Normal engine and Tauri builds do not enable or link the dependency.
+- The spike added 27 locked transitive build/runtime packages. The dependency is now used by the production engine after separate owner approval.
 - The crate is MIT licensed and embeds the upstream MIT-licensed Signalsmith implementation.
 
 ## Measured Results

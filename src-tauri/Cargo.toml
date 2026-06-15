@@ -18,3 +18,10 @@ djapp-audio-spike = { path = ".." }
 serde = { version = "1.0.228", features = ["derive"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2.7.1"
+
+# Tauri dev remains debuggable, but real-time audio cannot run unoptimized.
+[profile.dev.package.djapp-audio-spike]
+opt-level = 3
+
+[profile.dev.package.signalsmith-stretch]
+opt-level = 3

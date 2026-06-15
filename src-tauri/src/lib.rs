@@ -116,6 +116,11 @@ struct DeckView {
     recycle_failures: u64,
     stream_errors: u64,
     worker_error: Option<String>,
+    tempo_percent: f32,
+    key_lock: bool,
+    pitch_semitones: f32,
+    tempo_ratio: f64,
+    processor_latency_ms: f64,
 }
 
 impl From<DeckServiceSnapshot> for DeckView {
@@ -145,6 +150,15 @@ impl From<DeckServiceSnapshot> for DeckView {
             recycle_failures: snapshot.recycle_failures,
             stream_errors: snapshot.stream_errors,
             worker_error: snapshot.worker_error,
+            tempo_percent: snapshot.tempo_percent,
+            key_lock: snapshot.key_lock,
+            pitch_semitones: snapshot.pitch_semitones,
+            tempo_ratio: snapshot.tempo_ratio,
+            processor_latency_ms: snapshot
+                .sample_rate
+                .filter(|rate| *rate > 0)
+                .map(|rate| snapshot.processor_latency_frames as f64 * 1_000.0 / f64::from(rate))
+                .unwrap_or(0.0),
         }
     }
 }
@@ -526,6 +540,90 @@ async fn deck_b_set_gain(
     .await
 }
 
+async fn set_deck_tempo(
+    percent: f32,
+    deck: DeckId,
+    state: tauri::State<'_, AppState>,
+) -> Result<MixerView, String> {
+    mixer_command(
+        move |mixer| mixer.set_tempo(deck, percent),
+        Arc::clone(&state.mixer),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn deck_a_set_tempo(
+    percent: f32,
+    state: tauri::State<'_, AppState>,
+) -> Result<MixerView, String> {
+    set_deck_tempo(percent, DeckId::A, state).await
+}
+
+#[tauri::command]
+async fn deck_b_set_tempo(
+    percent: f32,
+    state: tauri::State<'_, AppState>,
+) -> Result<MixerView, String> {
+    set_deck_tempo(percent, DeckId::B, state).await
+}
+
+async fn set_deck_key_lock(
+    enabled: bool,
+    deck: DeckId,
+    state: tauri::State<'_, AppState>,
+) -> Result<MixerView, String> {
+    mixer_command(
+        move |mixer| mixer.set_key_lock(deck, enabled),
+        Arc::clone(&state.mixer),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn deck_a_set_key_lock(
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<MixerView, String> {
+    set_deck_key_lock(enabled, DeckId::A, state).await
+}
+
+#[tauri::command]
+async fn deck_b_set_key_lock(
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<MixerView, String> {
+    set_deck_key_lock(enabled, DeckId::B, state).await
+}
+
+async fn set_deck_pitch(
+    semitones: f32,
+    deck: DeckId,
+    state: tauri::State<'_, AppState>,
+) -> Result<MixerView, String> {
+    mixer_command(
+        move |mixer| mixer.set_pitch(deck, semitones),
+        Arc::clone(&state.mixer),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn deck_a_set_pitch(
+    semitones: f32,
+    state: tauri::State<'_, AppState>,
+) -> Result<MixerView, String> {
+    set_deck_pitch(semitones, DeckId::A, state).await
+}
+
+#[tauri::command]
+async fn deck_b_set_pitch(
+    semitones: f32,
+    state: tauri::State<'_, AppState>,
+) -> Result<MixerView, String> {
+    set_deck_pitch(semitones, DeckId::B, state).await
+}
+
 async fn persist_mixer_setting(
     state: &tauri::State<'_, AppState>,
     key: &str,
@@ -664,6 +762,12 @@ pub fn run() {
             mixer_set_master_gain,
             deck_a_set_gain,
             deck_b_set_gain,
+            deck_a_set_tempo,
+            deck_b_set_tempo,
+            deck_a_set_key_lock,
+            deck_b_set_key_lock,
+            deck_a_set_pitch,
+            deck_b_set_pitch,
             deck_a_set_cue,
             deck_b_set_cue,
             mixer_set_cue_blend,

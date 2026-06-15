@@ -62,6 +62,7 @@ impl EngineRateDecoder {
             if let Some(mut chunk) = converter.pending.pop_front() {
                 if buffer.capacity() >= chunk.samples.len() {
                     let mut reused = buffer;
+                    reused.clear();
                     reused.extend_from_slice(&chunk.samples);
                     chunk.samples = reused;
                 }
@@ -290,6 +291,21 @@ mod tests {
         (info, samples)
     }
 
+    fn decode_at_reusing_buffers(path: &str, target_rate: u32) -> (MediaInfo, Vec<f32>) {
+        let source = MediaDecoder::open(path).unwrap();
+        let info = source.info().clone();
+        let mut decoder = EngineRateDecoder::new(source, target_rate).unwrap();
+        let mut decode_buffer = Vec::new();
+        let mut samples = Vec::new();
+        while let Some(chunk) = decoder.next_chunk_into(decode_buffer).unwrap() {
+            assert_eq!(chunk.sample_rate, target_rate);
+            assert_eq!(chunk.channels, info.channels);
+            samples.extend_from_slice(&chunk.samples);
+            decode_buffer = chunk.samples;
+        }
+        (info, samples)
+    }
+
     #[test]
     fn resamples_48k_to_44k1_with_expected_frame_count() {
         let (info, samples) = decode_at("tests/fixtures/audio/tone-48k.wav", 44_100);
@@ -305,6 +321,14 @@ mod tests {
         let frames = samples.len() / info.channels;
         assert!((frames as isize - 144_000).abs() <= 1);
         assert!(samples.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn reused_output_buffer_does_not_append_previous_audio() {
+        let (_, fresh) = decode_at("tests/fixtures/audio/tone.mp3", 48_000);
+        let (_, reused) = decode_at_reusing_buffers("tests/fixtures/audio/tone.mp3", 48_000);
+        assert_eq!(reused.len(), fresh.len());
+        assert_eq!(reused, fresh);
     }
 
     #[test]

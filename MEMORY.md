@@ -6,14 +6,14 @@ Read this file before every task and update it after every meaningful change. Ke
 
 ## Current State
 
-- Status: ADR-011 architecture is approved and its isolated Signalsmith spike passes synthetic acceptance; production tempo integration awaits owner approval and listening acceptance.
+- Status: Reliable streaming vinyl-style rate adjustment is implemented without Signalsmith. The engine-rate recycled-buffer repetition defect is fixed and confirmed by the owner. Key lock and independent pitch remain fail-closed; BPM/beat-grid analysis is not implemented.
 - Target: private, offline-first macOS DJ desktop application.
 - Target hardware: Apple M3 Mac.
 - Implementation: reusable Rust engine plus a Tauri 2, React, TypeScript, and Vite macOS application scaffold.
 - Production architecture: approved.
 - Database schema: version 1 created and tested.
 - External APIs: none.
-- Known bugs: none confirmed. Physical channels 3–4 cue output has not yet been tested because no four-channel device or aggregate device is currently available.
+- Known bugs: Physical channels 3–4 cue output has not yet been tested because no four-channel device or aggregate device is currently available. BPM, beat-grid, key, waveform, and loudness analysis are not implemented.
 
 ## Confirmed Product Decisions
 
@@ -82,15 +82,15 @@ Reasoning: a desktop application is better suited than a browser application for
 
 - SQLite schema version 1 is embedded in `src/persistence.rs` and tracked with `PRAGMA user_version`.
 - A single-owner persistence worker provides typed settings, track-upsert, and queue commands. Direct database access is confined to the persistence module.
-- Internal Tauri commands include library scanning/query; output-device discovery and selection; Deck A and Deck B load/play/pause/seek/stop; `mixer_snapshot`; per-deck gain and cue selection; crossfader; master gain; cue gain; and cue/master blend. Deck transport commands return the combined mixer snapshot. No external API contracts exist.
+- Internal Tauri commands include library scanning/query; output-device discovery and selection; Deck A and Deck B load/play/pause/seek/stop; per-deck tempo, key lock, pitch, gain, and cue selection; `mixer_snapshot`; crossfader; master gain; cue gain; and cue/master blend. Deck transport commands return the combined mixer snapshot. No external API contracts exist.
 
 ## Known Issues And Risks
 
 - Target machine runs macOS 26.4.1 on arm64 Apple M3 hardware.
-- CPAL 0.18.1, `rtrb` 0.3.4, Symphonia 0.6.0, Rubato 3.0.0, and `rusqlite` 0.40.1 with bundled SQLite are approved and locked. `signalsmith-stretch` 0.1.3 is locked only as an optional spike dependency; production use still requires approval.
+- CPAL 0.18.1, `rtrb` 0.3.4, Symphonia 0.6.0, Rubato 3.0.0, `rusqlite` 0.40.1 with bundled SQLite, and `signalsmith-stretch` 0.1.3 are approved and locked production dependencies.
 - The project minimum toolchain is Rust 1.96 because the approved bundled SQLite build does not compile on the previous Rust 1.85 toolchain.
 - Exact effects for version 1 have not been selected.
-- Performance and latency targets have not been benchmarked.
+- Signalsmith's default preset reports 120 ms processor latency and has ample two-deck release CPU headroom on the Apple M3. Whole-application latency and remaining DSP performance targets still require measurement.
 - Headphone cue without separate audio hardware may be limited by macOS device capabilities.
 - CPAL's CoreAudio backend may report `unknown` interface type for some Bluetooth devices, so the UI displays wireless latency guidance beside all output selections.
 - Public distribution would introduce signing, notarization, licensing, privacy, and support requirements.
@@ -103,8 +103,8 @@ Reasoning: a desktop application is better suited than a browser application for
 ## Next Meaningful Tasks
 
 1. Complete the Signalsmith listening check on percussion, vocals, bass-heavy music, and sustained harmonic material.
-2. Approve or reject production `TempoProcessor` integration using `signalsmith-stretch` 0.1.3.
-3. If approved, implement worker-side manual tempo, key lock, independent pitch, latency-aware snapshots, and UI controls without enabling beat sync yet.
+2. Design and approve momentary pitch-bend and playing/paused jog behavior on top of the production tempo worker.
+3. Implement BPM and beat-grid analysis before enabling master/follower Sync.
 
 ### 2026-06-13 - Dependency Architecture Evaluation
 
@@ -357,6 +357,132 @@ Reasoning: a desktop application is better suited than a browser application for
 - Reason: Validate native Apple-silicon build compatibility, latency, CPU headroom, tempo ratios, pitch accuracy, reset/flush behavior, and sustained two-deck processing before production integration.
 - Verification: The crate built without patches using AppleClang C++14 and Bindgen. Unit tests, formatting, Clippy with warnings denied, and normal all-target checks pass. Both presets passed five tempo ratios and five pitch shifts; worst pitch error was 9.37 cents. Reset/flush stress remained finite. The default-preset release soak processed two concurrent 1,800-second stereo decks in 15.011 seconds with zero simulated buffered underflows; 23 isolated scheduling spikes were absorbed by its 120 ms processor buffer. The spike arm64 executable is 677,336 bytes and links only system `libc++` and `libSystem`.
 - Follow-up: Complete manual listening acceptance, then request owner approval for production integration behind the ADR-011 `TempoProcessor` boundary. Beat sync remains deferred until BPM and beat-grid analysis exists.
+
+### 2026-06-15 - Stage-Fourteen Production Tempo And Pitch Completed
+
+- Type: completed
+- Status: completed
+- Change: The owner approved production Signalsmith integration. Added a project-owned per-deck `TempoProcessor` after fixed sample-rate conversion, production `signalsmith-stretch` 0.1.3 dependency, `-16%` to `+16%` tempo, default-on key lock, independent `-12` to `+12` semitone pitch, latency-aware EOF/reset handling, source-position tracking, device-recovery restoration, Tauri commands, snapshots, and functional deck controls. Sync remains disabled pending BPM and beat-grid analysis.
+- Reason: Deliver dependable manual speed and pitch control without placing native processing or allocation in the CoreAudio callbacks or pretending beat synchronization is available before analysis exists.
+- Verification: Forty-five engine/CLI/spike tests and two default Tauri tests pass; formatting, engine and Tauri Clippy with warnings denied, frontend production build, and release builds pass. A ten-second optimized Apple M3 run stretched both mixed-rate decks at different tempos, with key lock disabled and `+3` semitones on Deck B, while routing master to speakers and cue to headphones. It completed 882 master and 885 cue callbacks with zero stream errors, cue underflows, or cue overflows and a nonzero cue signal. An unoptimized run produced one cue underflow, so real-time performance acceptance remains release-only.
+- Follow-up: Complete representative music listening acceptance. Then obtain approval for pitch-bend and jog implementation; BPM/beat-grid analysis is required before Sync.
+
+### 2026-06-15 - Neutral Playback Repetition Regression Fixed
+
+- Type: bug
+- Status: superseded by Continuous Tempo Processing Timeline
+- Change: Neutral `0%` tempo and `0`-semitone playback now bypasses Signalsmith and passes decoded/resampled PCM through unchanged with zero processor latency. Switching between bypass and stretched modes resets processor state, and latency telemetry updates when the mode changes.
+- Reason: Routing every song through spectral time stretching even when no tempo or pitch effect was requested introduced unnecessary latency and could produce repeated-window artifacts or debug-build starvation during normal full-song playback.
+- Verification: New tests prove sample-for-sample neutral passthrough, zero neutral latency, no neutral EOF flush output, and safe bypass/stretch transitions. The optimized direct CoreAudio mixed-rate two-deck test passed with zero deck underflows, stream errors, recycling failures, or worker errors.
+- Follow-up: Manually replay the affected song at neutral settings. Non-neutral music quality listening remains part of Stage Fourteen acceptance.
+
+### 2026-06-15 - Live Tempo Change Loop Regression Fixed
+
+- Type: bug
+- Status: superseded by Live Tempo Changes No Longer Seek and Continuous Tempo Processing Timeline
+- Change: Tempo, key-lock, and pitch changes now create a new deck generation at the currently audible source position. The render queue rejects old blocks, and one atomic worker command applies settings, seeks the decoder, resets Signalsmith, clears pending output, and resumes the previous play state. No-op setting changes no longer restart transport.
+- Reason: Live tempo changes previously reset Signalsmith while decoded and processed blocks from the old timeline remained queued. Combining those old blocks with the restarted processor could replay a short section and corrupt progression.
+- Verification: The full automated suite and Clippy pass. An optimized Apple M3 hardware regression started both decks at neutral settings, changed them live to `-8%` and `+8%`, changed key lock and pitch, verified forward source progression, and completed ten seconds of repeated seek/reset activity with 974 master callbacks, 976 cue callbacks, nonzero headphone signal, and zero stream errors, cue underflows, or cue overflows.
+- Follow-up: Manually retry the affected full song with live tempo changes. Listening-quality acceptance remains open.
+
+### 2026-06-15 - Fader Pre-Roll And UI Race Fixed
+
+- Type: bug
+- Status: completed
+- Status: superseded in part
+- Change: Tempo and pitch sliders retain local state while dragged, ignore snapshot polling during the gesture, and submit the range element's exact release value. The initial input-pre-roll implementation was removed after real-song testing showed it duplicated post-change audio.
+- Reason: UI snapshot polling could overwrite a slider during a drag, and pointer release could submit the previous React state value. The attempted pre-roll incorrectly supplied future samples as history and then processed the same samples again.
+- Verification: Nonrepeating chirp tests continue to reject repeated streaming output windows. UI and audio regression suites remain active.
+- Follow-up: Restart the desktop app and repeat the affected tempo/pitch gesture on the original song. Representative music listening acceptance remains open.
+
+### 2026-06-15 - Tauri Dev Audio Optimization
+
+- Type: bug
+- Status: completed
+- Change: The Tauri development profile now compiles the project audio engine and `signalsmith-stretch` at optimization level 3 while leaving the Tauri shell and frontend in their normal development profiles.
+- Reason: `npm run tauri dev` previously ran the native time stretcher unoptimized. The isolated spike and hardware testing already showed that unoptimized Signalsmith can miss audio deadlines even when the release implementation is healthy.
+- Verification: The Tauri development-profile Apple M3 hardware regression completed live `-8%` and `+8%` tempo changes plus key-lock and pitch changes over 973 master and 975 cue callbacks. It reported nonzero headphone signal and zero master/cue stream errors, cue underflows, or cue overflows.
+- Follow-up: Retest the original song using a freshly rebuilt `npm run tauri dev` process.
+
+### 2026-06-15 - Duplicate Fader Pre-Roll Removed
+
+- Type: bug
+- Status: completed
+- Change: Removed the post-fader pre-roll buffer that passed the first future audio window to Signalsmith as seek history and then passed those same samples to streaming process. Live changes resume through the standard streaming process path.
+
+### 2026-06-15 - Live Tempo Changes No Longer Seek
+
+- Change: Tempo, key-lock, and pitch changes update Signalsmith in place on the decoder worker. They no longer increment the deck generation, clear queued audio, or seek the decoder.
+- Reason: Compressed MP3/AAC seeks may resolve to an earlier packet. Seeking on every fader movement could replay the same source section and sound like a loop. Generation changes remain reserved for actual transport seeks and track replacement.
+- Tradeoff: The control takes effect after the small bounded decoded queue already in flight, rather than immediately restarting at the audible position.
+- Verification: The worker regression proves live changes remain in the current generation; the single-output and dual-output CoreAudio regressions both exercise live tempo changes and require forward source progression.
+- Reason: The duplicate feed can audibly replay the first section after a tempo or pitch change on real music even though stationary sine-wave fixtures appear normal.
+- Verification: Nonrepeating chirp and full regression tests are used to verify forward streaming, and the actual Tauri development executable is rebuilt before manual retesting.
+- Follow-up: Retest the original song after fully stopping the previous app process.
+
+### 2026-06-15 - Neutral-To-Stretch History Corrected
+
+- Type: bug
+- Status: superseded by Continuous Tempo Processing Timeline
+- Change: Neutral bypass now retains one Signalsmith input-latency window of already-consumed PCM. Entering non-neutral tempo or pitch uses that past audio as seek history while processing every current and future sample exactly once. Actual transport resets clear the history.
+- Reason: Starting the stretcher mid-song without preceding context can destabilize its first analysis windows. The earlier rejected pre-roll used future samples and duplicated them; this implementation uses only past samples and cannot replay them into the output timeline.
+- Verification: A new chirp transition regression enters stretch after one second of neutral playback, produces non-silent output, and rejects repeated output windows.
+- Follow-up: Repeat the original real-song BPM-change listening test.
+
+### 2026-06-15 - Continuous Tempo Processing Timeline
+
+- Type: bug
+- Status: superseded; continuous neutral processing worsened real-song playback
+- Change: Supersedes neutral bypass and transition-history approaches. Signalsmith now processes the deck continuously from track start, including neutral settings. Live BPM and pitch changes update the existing processor without reset, seek, pre-roll, or a bypass-to-stretch mode switch.
+- Reason: The owner continued to hear a repeated section specifically when leaving neutral tempo. Keeping one processing timeline removes the last transition that could reintroduce already-heard spectral context.
+- Tradeoff: Neutral playback carries the approved 120 ms processor latency and native processing cost. Tauri dev keeps the engine and Signalsmith optimized.
+- Verification: Neutral duration accounting and a non-periodic chirp regression cover a live neutral-to-`+8%` change and reject repeated output windows.
+- Follow-up: Confirm behavior on the affected real track.
+
+### 2026-06-15 - Neutral Playback Restored, Tempo Issue Open
+
+- Type: bug
+- Status: unresolved
+- Change: Restored direct PCM bypass at neutral tempo and pitch after the continuous Signalsmith experiment caused looping during ordinary playback. Non-neutral tempo remains available for diagnosis but is not accepted as reliable. The deck now labels the value as playback `RATE`, not BPM.
+- Reason: Core playback reliability takes priority. Track BPM analysis is not implemented, but manual playback-rate processing does not require BPM metadata; analysis will later support BPM display, beat grids, Sync, and AutoMix.
+- Verification: Neutral playback is sample-for-sample in automated tests, reports zero stretch latency, and does not flush processor output.
+- Follow-up: Reproduce non-neutral processing with representative real audio before changing its production path again.
+
+### 2026-06-15 - Unreliable Rate Adjustment Disabled
+
+- Type: bug
+- Status: completed safety mitigation; underlying tempo defect unresolved
+- Change: Disabled the deck rate slider, added a visible `RATE LOCKED` state, made the Rust mixer reject every nonzero tempo command, and made device recovery restore `0%` instead of an unsafe rate.
+- Reason: Real-song testing repeatedly confirms looping whenever non-neutral rate processing is engaged. Normal playback must remain dependable while the processor integration is reworked from representative audio evidence.
+- Verification: Engine and Tauri tests require nonzero rate requests to fail and snapshots to remain at `0%`.
+- Follow-up: Build a redistributable representative-music fixture or diagnostic capture before re-enabling rate adjustment.
+
+### 2026-06-15 - Diagnostic Corpus And Varispeed Rate Fallback
+
+- Type: bug
+- Status: completed
+- Change: Added an original 20-second music-like WAV fixture plus MP3/M4A encodings, a queued offline rate diagnostic with repeated-window detection, and a stateful project-owned linear varispeed processor. Re-enabled the rate slider as `VINYL RATE`; key lock and independent pitch remain disabled.
+- Reason: Signalsmith passed controlled WAV/MP3/M4A diagnostics but repeatedly looped on the owner's music. Varispeed changes pitch with speed but avoids spectral analysis and its repeated-grain failure mode.
+- Verification: Direct and 16-block queued diagnostics at `+8%` and `-8%` report no repeated windows for WAV, MP3, and M4A. Varispeed unit tests verify output duration and zero processor latency. The Apple M3 CoreAudio regression changed both playing decks to `-8%` and `+8%`, completed 60 callbacks, and reported zero underflows, clipping, stream errors, recycle failures, or worker errors.
+- Follow-up: Complete target-hardware listening acceptance before considering the rate path final. Revisit key lock/pitch separately with representative licensed test material.
+
+### 2026-06-15 - Engine-Rate Buffer Repetition Fixed
+
+- Type: bug
+- Status: completed
+- Change: `EngineRateDecoder` now clears a recycled PCM buffer before copying the next resampler output into it. The full-track tempo diagnostic is capped at the 20-second rate-transition window, and a regression compares fresh-buffer decoding with production-style buffer reuse.
+- Reason: For tracks whose native sample rate differs from the 48 kHz engine rate, the resampler appended each new converted block after samples retained from the previous block. This replayed earlier audio and made rate changes appear to loop on MP3 and affected WAV files; the defect was in sample-rate conversion, not BPM analysis or varispeed interpolation.
+- Verification: The affected private 44.1 kHz MP3 reproduced an exact repeated window before the fix and reports `repeat_detected=false` afterward. Its 20-second diagnostic decoded-frame count fell from 1,845,280 accumulated frames to the expected 974,880. The reusable-buffer regression produces sample-for-sample output equal to fresh-buffer decoding.
+- Follow-up: Restart `npm run tauri dev` so the native engine rebuilds, then repeat the same MP3 and WAV listening test.
+
+### 2026-06-15 - Track Analysis Pipeline Proposed
+
+- Type: decision
+- Status: proposed
+- Change: Created `docs/architecture/ADR-012-track-analysis-pipeline.md`. It proposes a single bounded background worker, project-owned waveform/BPM/beat-grid/downbeat/key algorithms, versioned atomic cache files, confidence-based feature gating, and the existing SQLite schema. The only proposed new dependencies are `rustfft` and `ebur128`.
+- Reason: Trustworthy cached analysis is required before BPM display, real waveforms, Sync, gain normalization, and analysis-driven AutoMix can be enabled without risking audio reliability or misleading the DJ.
+- Verification: The proposal was checked against ADR-001, ADR-003, ADR-011, the current persistence schema, requirements, and audio-thread rules. No dependency, schema, implementation, or UI layout change was made.
+- Follow-up: Obtain owner approval for ADR-012 before adding dependencies or implementing the pipeline.
 
 ## Update Template
 

@@ -10,6 +10,7 @@ use std::{
 use djapp_audio_spike::{
     deck::{DeckSnapshot, DeckState},
     mixer::{DeckId, MixerEngine},
+    tempo::TempoSettings,
 };
 
 #[derive(Clone, Debug)]
@@ -29,6 +30,11 @@ pub struct DeckServiceSnapshot {
     pub recycle_failures: u64,
     pub stream_errors: u64,
     pub worker_error: Option<String>,
+    pub tempo_percent: f32,
+    pub key_lock: bool,
+    pub pitch_semitones: f32,
+    pub tempo_ratio: f64,
+    pub processor_latency_frames: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +177,21 @@ enum Command {
         gain: f32,
         response: Response,
     },
+    SetTempo {
+        deck: DeckId,
+        percent: f32,
+        response: Response,
+    },
+    SetKeyLock {
+        deck: DeckId,
+        enabled: bool,
+        response: Response,
+    },
+    SetPitch {
+        deck: DeckId,
+        semitones: f32,
+        response: Response,
+    },
     SetCrossfader {
         value: f32,
         response: Response,
@@ -293,6 +314,42 @@ impl MixerService {
         self.request(|response| Command::SetChannelGain {
             deck,
             gain,
+            response,
+        })
+    }
+
+    pub fn set_tempo(
+        &self,
+        deck: DeckId,
+        percent: f32,
+    ) -> Result<MixerServiceSnapshot, String> {
+        self.request(|response| Command::SetTempo {
+            deck,
+            percent,
+            response,
+        })
+    }
+
+    pub fn set_key_lock(
+        &self,
+        deck: DeckId,
+        enabled: bool,
+    ) -> Result<MixerServiceSnapshot, String> {
+        self.request(|response| Command::SetKeyLock {
+            deck,
+            enabled,
+            response,
+        })
+    }
+
+    pub fn set_pitch(
+        &self,
+        deck: DeckId,
+        semitones: f32,
+    ) -> Result<MixerServiceSnapshot, String> {
+        self.request(|response| Command::SetPitch {
+            deck,
+            semitones,
             response,
         })
     }
@@ -534,6 +591,69 @@ fn run(
                 device_recoveries,
                 device_message.as_deref(),
                 |engine| engine.stop(deck),
+            ),
+            Command::SetTempo {
+                deck,
+                percent,
+                response,
+            } => respond(
+                response,
+                &mut engine,
+                &loaded_a,
+                &loaded_b,
+                crossfader,
+                channel_gain_a,
+                channel_gain_b,
+                master_gain,
+                cue,
+                &routing,
+                output_device_id.as_deref(),
+                output_device_name.as_deref(),
+                device_recoveries,
+                device_message.as_deref(),
+                |engine| engine.set_tempo(deck, percent),
+            ),
+            Command::SetKeyLock {
+                deck,
+                enabled,
+                response,
+            } => respond(
+                response,
+                &mut engine,
+                &loaded_a,
+                &loaded_b,
+                crossfader,
+                channel_gain_a,
+                channel_gain_b,
+                master_gain,
+                cue,
+                &routing,
+                output_device_id.as_deref(),
+                output_device_name.as_deref(),
+                device_recoveries,
+                device_message.as_deref(),
+                |engine| engine.set_key_lock(deck, enabled),
+            ),
+            Command::SetPitch {
+                deck,
+                semitones,
+                response,
+            } => respond(
+                response,
+                &mut engine,
+                &loaded_a,
+                &loaded_b,
+                crossfader,
+                channel_gain_a,
+                channel_gain_b,
+                master_gain,
+                cue,
+                &routing,
+                output_device_id.as_deref(),
+                output_device_name.as_deref(),
+                device_recoveries,
+                device_message.as_deref(),
+                |engine| engine.set_pitch(deck, semitones),
             ),
             Command::SetChannelGain {
                 deck,
@@ -1101,6 +1221,11 @@ fn unloaded() -> DeckServiceSnapshot {
         recycle_failures: 0,
         stream_errors: 0,
         worker_error: None,
+        tempo_percent: 0.0,
+        key_lock: false,
+        pitch_semitones: 0.0,
+        tempo_ratio: 1.0,
+        processor_latency_frames: 0,
     }
 }
 
@@ -1125,6 +1250,11 @@ fn deck_snapshot(
         recycle_failures,
         stream_errors,
         worker_error,
+        tempo_percent,
+        key_lock,
+        pitch_semitones,
+        tempo_ratio,
+        processor_latency_frames,
         ..
     } = match deck {
         DeckId::A => engine.snapshot().deck_a,
@@ -1146,6 +1276,11 @@ fn deck_snapshot(
         recycle_failures,
         stream_errors,
         worker_error,
+        tempo_percent,
+        key_lock,
+        pitch_semitones,
+        tempo_ratio,
+        processor_latency_frames,
     }
 }
 
@@ -1328,7 +1463,15 @@ fn restart_engine(
                 .media(deck)
                 .map(|media| snapshot.position_frames as f64 / f64::from(media.output_sample_rate))
                 .unwrap_or(0.0);
-            (seconds, snapshot.state == DeckState::Playing)
+            (
+                seconds,
+                snapshot.state == DeckState::Playing,
+                TempoSettings {
+                    tempo_percent: snapshot.tempo_percent,
+                    key_lock: snapshot.key_lock,
+                    pitch_semitones: snapshot.pitch_semitones,
+                },
+            )
         })
     });
     drop(previous);
@@ -1383,7 +1526,7 @@ fn build_restored_engine(
     device_id: Option<&str>,
     loaded_a: &Option<LoadedTrack>,
     loaded_b: &Option<LoadedTrack>,
-    positions: Option<[(f64, bool); 2]>,
+    positions: Option<[(f64, bool, TempoSettings); 2]>,
     crossfader: f32,
     channel_gain_a: f32,
     channel_gain_b: f32,
@@ -1461,7 +1604,7 @@ fn restore_deck(
     engine: &mut MixerEngine,
     deck: DeckId,
     loaded: Option<&LoadedTrack>,
-    position: Option<(f64, bool)>,
+    position: Option<(f64, bool, TempoSettings)>,
 ) -> Result<(), String> {
     let Some(loaded) = loaded else {
         return Ok(());
@@ -1469,7 +1612,16 @@ fn restore_deck(
     engine
         .load_track(deck, &loaded.path, false)
         .map_err(|error| error.to_string())?;
-    if let Some((seconds, playing)) = position {
+    if let Some((seconds, playing, settings)) = position {
+        engine
+            .set_tempo(deck, settings.tempo_percent)
+            .map_err(|error| error.to_string())?;
+        engine
+            .set_key_lock(deck, false)
+            .map_err(|error| error.to_string())?;
+        engine
+            .set_pitch(deck, 0.0)
+            .map_err(|error| error.to_string())?;
         engine
             .seek(deck, seconds, playing)
             .map_err(|error| error.to_string())?;
@@ -1560,6 +1712,23 @@ mod tests {
         service.set_crossfader(-1.0).unwrap();
         service.play(DeckId::A).unwrap();
         service.play(DeckId::B).unwrap();
+        thread::sleep(Duration::from_millis(500));
+        let before_tempo_change = service.snapshot().unwrap();
+        service.set_tempo(DeckId::A, -8.0).unwrap();
+        service.set_tempo(DeckId::B, 8.0).unwrap();
+        assert!(service.set_key_lock(DeckId::A, true).is_err());
+        service.set_key_lock(DeckId::B, false).unwrap();
+        assert!(service.set_pitch(DeckId::B, 3.0).is_err());
+        thread::sleep(Duration::from_millis(500));
+        let after_tempo_change = service.snapshot().unwrap();
+        assert!(
+            after_tempo_change.deck_a.position_frames >= before_tempo_change.deck_a.position_frames,
+            "Deck A moved backward after its live tempo change"
+        );
+        assert!(
+            after_tempo_change.deck_b.position_frames >= before_tempo_change.deck_b.position_frames,
+            "Deck B moved backward after its live tempo change"
+        );
         let started = Instant::now();
         let mut next_seek = Duration::from_millis(1_500);
         let mut next_report = Duration::from_secs(60);
@@ -1586,6 +1755,10 @@ mod tests {
             assert_eq!(current.cue_stream_errors, 0);
             assert_eq!(current.cue_underflow_callbacks, 0);
             assert_eq!(current.cue_overflow_callbacks, 0);
+            assert_eq!(current.deck_a.tempo_percent, -8.0);
+            assert_eq!(current.deck_b.tempo_percent, 8.0);
+            assert!(!current.deck_b.key_lock);
+            assert_eq!(current.deck_b.pitch_semitones, 0.0);
             if elapsed >= next_report {
                 println!(
                     "elapsed_seconds={} master_frames={} cue_frames={} relative_frames={} cue_depth={} cue_min={} cue_max={}",
@@ -1667,6 +1840,26 @@ mod tests {
         service.play(DeckId::A).unwrap();
         service.play(DeckId::B).unwrap();
         thread::sleep(Duration::from_millis(700));
+        let before_tempo_change = service.snapshot().unwrap();
+        service.set_tempo(DeckId::A, -8.0).unwrap();
+        service.set_tempo(DeckId::B, 8.0).unwrap();
+        assert!(service.set_key_lock(DeckId::A, true).is_err());
+        service.set_key_lock(DeckId::B, false).unwrap();
+        assert!(service.set_pitch(DeckId::B, 3.0).is_err());
+        thread::sleep(Duration::from_millis(500));
+        let after_tempo_change = service.snapshot().unwrap();
+        assert!(
+            after_tempo_change.deck_a.position_frames > before_tempo_change.deck_a.position_frames,
+            "Deck A did not progress through its live tempo change"
+        );
+        assert!(
+            after_tempo_change.deck_b.position_frames > before_tempo_change.deck_b.position_frames,
+            "Deck B did not progress through its live tempo change"
+        );
+        assert_eq!(after_tempo_change.deck_a.tempo_percent, -8.0);
+        assert_eq!(after_tempo_change.deck_b.tempo_percent, 8.0);
+        assert!(!after_tempo_change.deck_b.key_lock);
+        assert_eq!(after_tempo_change.deck_b.pitch_semitones, 0.0);
         let before_switch = service.snapshot().unwrap();
         let default_device = djapp_audio_spike::device::output_devices()
             .unwrap()

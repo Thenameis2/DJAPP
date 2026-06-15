@@ -26,6 +26,7 @@ use crate::{
         output_devices, preferred_output_config, resolve_output_device, validate_dual_output_pair,
     },
     media::{decode::MediaDecoder, resample::EngineRateDecoder},
+    tempo::TempoSettings,
 };
 
 const MIXER_QUEUE_CAPACITY: usize = 64;
@@ -58,6 +59,7 @@ struct DeckPipeline {
     media: Option<DeckMediaInfo>,
     output_sample_rate: u32,
     position_base_frames: u64,
+    tempo_settings: TempoSettings,
 }
 
 impl DeckPipeline {
@@ -80,6 +82,7 @@ impl DeckPipeline {
                 media: None,
                 output_sample_rate,
                 position_base_frames: 0,
+                tempo_settings: TempoSettings::default(),
             },
             DeckRender {
                 commands: render_commands,
@@ -117,6 +120,7 @@ impl DeckPipeline {
                 .send(WorkerCommand::Replace {
                     path,
                     generation: self.generation,
+                    tempo_settings: self.tempo_settings,
                 })
                 .map_err(|_| MixerControlError::WorkerStopped)?;
         } else {
@@ -133,6 +137,7 @@ impl DeckPipeline {
                 worker_commands,
                 Arc::clone(&self.metrics),
                 Arc::clone(&self.worker_error),
+                self.tempo_settings,
             ));
             self.worker_control = Some(worker_control);
         }
@@ -202,6 +207,14 @@ impl DeckPipeline {
                 .lock()
                 .ok()
                 .and_then(|value| value.clone()),
+            tempo_percent: self.tempo_settings.tempo_percent,
+            key_lock: self.tempo_settings.key_lock,
+            pitch_semitones: self.tempo_settings.pitch_semitones,
+            tempo_ratio: self.tempo_settings.tempo_ratio(),
+            processor_latency_frames: self
+                .metrics
+                .processor_latency_frames
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -482,6 +495,28 @@ impl MixerEngine {
         self.deck_mut(deck).send(RenderCommand::SetGain(gain))
     }
 
+    pub fn set_tempo(&mut self, deck: DeckId, percent: f32) -> Result<(), MixerControlError> {
+        self.update_tempo_settings(deck, |settings| {
+            settings.tempo_percent = percent;
+            settings.key_lock = false;
+            settings.pitch_semitones = 0.0;
+        })
+    }
+
+    pub fn set_key_lock(&mut self, deck: DeckId, enabled: bool) -> Result<(), MixerControlError> {
+        if enabled {
+            return Err(MixerControlError::KeyLockUnavailable);
+        }
+        self.update_tempo_settings(deck, |settings| settings.key_lock = enabled)
+    }
+
+    pub fn set_pitch(&mut self, deck: DeckId, semitones: f32) -> Result<(), MixerControlError> {
+        if semitones.abs() >= f32::EPSILON {
+            return Err(MixerControlError::PitchUnavailable);
+        }
+        self.update_tempo_settings(deck, |settings| settings.pitch_semitones = semitones)
+    }
+
     pub fn set_crossfader(&mut self, value: f32) -> Result<(), MixerControlError> {
         if !value.is_finite() {
             return Err(MixerControlError::InvalidValue);
@@ -599,6 +634,33 @@ impl MixerEngine {
             .map(|_| ())
             .ok_or(MixerControlError::DeckUnloaded)
     }
+
+    fn update_tempo_settings(
+        &mut self,
+        deck: DeckId,
+        update: impl FnOnce(&mut TempoSettings),
+    ) -> Result<(), MixerControlError> {
+        self.ensure_loaded(deck)?;
+        let pipeline = self.deck_mut(deck);
+        let mut settings = pipeline.tempo_settings;
+        update(&mut settings);
+        settings
+            .validate()
+            .map_err(|_| MixerControlError::InvalidValue)?;
+        if settings == pipeline.tempo_settings {
+            return Ok(());
+        }
+        let worker_control = pipeline
+            .worker_control
+            .as_ref()
+            .ok_or(MixerControlError::WorkerStopped)?
+            .clone();
+        worker_control
+            .send(WorkerCommand::SetTempo(settings))
+            .map_err(|_| MixerControlError::WorkerStopped)?;
+        pipeline.tempo_settings = settings;
+        Ok(())
+    }
 }
 
 impl Drop for MixerEngine {
@@ -651,6 +713,8 @@ pub enum MixerControlError {
     CueUnavailable,
     QueueFull,
     WorkerStopped,
+    KeyLockUnavailable,
+    PitchUnavailable,
     InvalidValue,
 }
 
@@ -663,6 +727,12 @@ impl fmt::Display for MixerControlError {
             ),
             Self::QueueFull => formatter.write_str("mixer control queue is full"),
             Self::WorkerStopped => formatter.write_str("decoder worker has stopped"),
+            Self::KeyLockUnavailable => formatter.write_str(
+                "key lock is temporarily unavailable while rate uses reliable varispeed",
+            ),
+            Self::PitchUnavailable => formatter.write_str(
+                "independent pitch is temporarily unavailable while spectral processing is under review",
+            ),
             Self::InvalidValue => formatter.write_str("mixer control value is invalid"),
         }
     }
@@ -1090,6 +1160,18 @@ mod tests {
         state.apply_commands(&mut consumer);
         assert_eq!(state.crossfader, 1.0);
         assert_eq!(state.master_gain, 0.0);
+    }
+
+    #[test]
+    fn unavailable_spectral_controls_have_explicit_errors() {
+        assert_eq!(
+            MixerControlError::KeyLockUnavailable.to_string(),
+            "key lock is temporarily unavailable while rate uses reliable varispeed"
+        );
+        assert_eq!(
+            MixerControlError::PitchUnavailable.to_string(),
+            "independent pitch is temporarily unavailable while spectral processing is under review"
+        );
     }
 
     #[test]

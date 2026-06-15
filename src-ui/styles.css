@@ -51,7 +51,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .tempo-rail button { width: 100%; padding: 7px 3px; border: 1px solid var(--line); border-radius: 4px; background: #111316; font-weight: 800; }
 .tempo-rail strong { margin-top: 4px; }
 .tempo-rail span { color: var(--muted); font-size: .65rem; }
-.tempo-rail input, .vertical-fader { width: 180px; margin-top: 65px; transform: rotate(-90deg); accent-color: var(--deck-color, var(--blue)); }
+.tempo-rail > input, .vertical-fader { width: 130px; margin: 48px 0 42px; transform: rotate(-90deg); accent-color: var(--deck-color, var(--blue)); }
+.tempo-rail .pitch-control { display: grid; gap: 3px; width: 100%; color: var(--muted); font-size: .55rem; text-align: center; }
+.tempo-rail .pitch-control input { width: 100%; margin: 0; accent-color: var(--deck-color, var(--blue)); }
 .platter { position: relative; width: min(250px, 24vw); aspect-ratio: 1; justify-self: center; border: 5px solid #50545b; border-radius: 50%; background: repeating-radial-gradient(circle, #050505 0 4px, #141414 5px 7px); box-shadow: 0 0 0 3px #090a0b, inset 0 0 24px #000, 0 8px 28px #0008; }
 .platter::before { content: ""; position: absolute; inset: 7%; border: 2px dotted #9ba0a7; border-radius: 50%; }
 .vinyl-rings { position: absolute; inset: 30%; display: grid; place-items: center; border: 2px solid #292c31; border-radius: 50%; background: #070809; }

@@ -3,7 +3,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, Receiver, TryRecvError},
         Arc, Mutex,
     },
@@ -21,6 +21,7 @@ use crate::media::{
     decode::{MediaDecoder, PcmChunk},
     resample::EngineRateDecoder,
 };
+use crate::tempo::{TempoProcessor, TempoSettings};
 
 pub(crate) const CONTROL_QUEUE_CAPACITY: usize = 64;
 pub(crate) const AUDIO_QUEUE_CAPACITY: usize = 16;
@@ -36,8 +37,16 @@ pub(crate) enum RenderCommand {
 
 #[derive(Debug)]
 pub(crate) enum WorkerCommand {
-    Seek { seconds: f64, generation: u64 },
-    Replace { path: PathBuf, generation: u64 },
+    Seek {
+        seconds: f64,
+        generation: u64,
+    },
+    Replace {
+        path: PathBuf,
+        generation: u64,
+        tempo_settings: TempoSettings,
+    },
+    SetTempo(TempoSettings),
     Shutdown,
 }
 
@@ -45,6 +54,7 @@ pub(crate) enum WorkerCommand {
 pub(crate) struct DecodedBlock {
     pub(crate) generation: u64,
     pub(crate) chunk: PcmChunk,
+    pub(crate) source_frames_per_output: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,6 +118,7 @@ impl DeckTransport {
             worker_commands,
             Arc::clone(&metrics),
             Arc::clone(&worker_error),
+            TempoSettings::default(),
         );
 
         let stream = match sample_format {
@@ -293,6 +304,7 @@ impl DeckTransport {
         self.worker_control.send(WorkerCommand::Replace {
             path,
             generation: self.generation,
+            tempo_settings: TempoSettings::default(),
         })?;
         Ok(())
     }
@@ -322,6 +334,16 @@ impl DeckTransport {
                 .lock()
                 .ok()
                 .and_then(|value| value.clone()),
+            tempo_percent: f32::from_bits(self.metrics.tempo_percent_bits.load(Ordering::Relaxed)),
+            key_lock: self.metrics.key_lock.load(Ordering::Relaxed),
+            pitch_semitones: f32::from_bits(
+                self.metrics.pitch_semitones_bits.load(Ordering::Relaxed),
+            ),
+            tempo_ratio: f64::from_bits(self.metrics.tempo_ratio_bits.load(Ordering::Relaxed)),
+            processor_latency_frames: self
+                .metrics
+                .processor_latency_frames
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -361,16 +383,25 @@ pub struct DeckSnapshot {
     pub stream_errors: u64,
     pub generation: u64,
     pub worker_error: Option<String>,
+    pub tempo_percent: f32,
+    pub key_lock: bool,
+    pub pitch_semitones: f32,
+    pub tempo_ratio: f64,
+    pub processor_latency_frames: u64,
 }
 
 impl DeckSnapshot {
     pub fn summary(&self) -> String {
         format!(
-            "Deck report: state={:?}, generation={}, position_frames={}, rendered_frames={}, callbacks={}, underflow_callbacks={}, stale_blocks={}, recycle_failures={}, stream_errors={}, worker_error={}",
+            "Deck report: state={:?}, generation={}, position_frames={}, rendered_frames={}, tempo_percent={}, key_lock={}, pitch_semitones={}, processor_latency_frames={}, callbacks={}, underflow_callbacks={}, stale_blocks={}, recycle_failures={}, stream_errors={}, worker_error={}",
             self.state,
             self.generation,
             self.position_frames,
             self.rendered_frames,
+            self.tempo_percent,
+            self.key_lock,
+            self.pitch_semitones,
+            self.processor_latency_frames,
             self.callbacks,
             self.underflow_callbacks,
             self.stale_blocks,
@@ -413,6 +444,11 @@ pub(crate) struct DeckMetrics {
     pub(crate) recycle_failures: AtomicU64,
     pub(crate) stream_errors: AtomicU64,
     pub(crate) playing: AtomicBool,
+    pub(crate) tempo_percent_bits: AtomicU32,
+    pub(crate) key_lock: AtomicBool,
+    pub(crate) pitch_semitones_bits: AtomicU32,
+    pub(crate) tempo_ratio_bits: AtomicU64,
+    pub(crate) processor_latency_frames: AtomicU64,
 }
 
 impl DeckMetrics {
@@ -430,6 +466,11 @@ impl DeckMetrics {
             recycle_failures: AtomicU64::new(0),
             stream_errors: AtomicU64::new(0),
             playing: AtomicBool::new(false),
+            tempo_percent_bits: AtomicU32::new(0.0_f32.to_bits()),
+            key_lock: AtomicBool::new(false),
+            pitch_semitones_bits: AtomicU32::new(0.0_f32.to_bits()),
+            tempo_ratio_bits: AtomicU64::new(1.0_f64.to_bits()),
+            processor_latency_frames: AtomicU64::new(0),
         }
     }
 }
@@ -440,6 +481,7 @@ pub(crate) struct RenderState {
     gain: f32,
     current: Option<DecodedBlock>,
     frame_offset: usize,
+    source_position: f64,
 }
 
 impl RenderState {
@@ -450,6 +492,7 @@ impl RenderState {
             gain: gain.clamp(0.0, 1.0),
             current: None,
             frame_offset: 0,
+            source_position: 0.0,
         }
     }
 
@@ -472,6 +515,7 @@ impl RenderState {
                     self.generation = generation;
                     self.playing = playing;
                     self.frame_offset = 0;
+                    self.source_position = 0.0;
                     metrics.position_frames.store(0, Ordering::Relaxed);
                     metrics.ended_generation.store(0, Ordering::Release);
                 }
@@ -539,7 +583,10 @@ impl RenderState {
                 *sample = block.chunk.samples[base + source_channel] * self.gain;
             }
             self.frame_offset += 1;
-            metrics.position_frames.fetch_add(1, Ordering::Relaxed);
+            self.source_position += block.source_frames_per_output;
+            metrics
+                .position_frames
+                .store(self.source_position.round() as u64, Ordering::Relaxed);
             metrics.rendered_frames.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -615,6 +662,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_decoder_worker(
     decoder: EngineRateDecoder,
     generation: u64,
@@ -623,12 +671,29 @@ pub(crate) fn spawn_decoder_worker(
     commands: Receiver<WorkerCommand>,
     metrics: Arc<DeckMetrics>,
     worker_error: Arc<Mutex<Option<String>>>,
+    initial_tempo_settings: TempoSettings,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut decoder = decoder;
+        let mut tempo = match TempoProcessor::new(
+            decoder.target_rate(),
+            decoder.info().channels,
+            initial_tempo_settings,
+        ) {
+            Ok(processor) => processor,
+            Err(error) => {
+                store_worker_error(&worker_error, error.to_string());
+                return;
+            }
+        };
+        metrics
+            .processor_latency_frames
+            .store(tempo.latency_frames() as u64, Ordering::Relaxed);
         let mut generation = generation;
         let mut pending: Option<DecodedBlock> = None;
         let mut eof = false;
+        let mut eof_reported = false;
+        let mut decode_buffer = Vec::new();
 
         loop {
             match commands.try_recv() {
@@ -637,9 +702,12 @@ pub(crate) fn spawn_decoder_worker(
                     generation: next_generation,
                 }) => match decoder.seek(seconds) {
                     Ok(_) => {
+                        tempo.reset();
                         generation = next_generation;
                         pending = None;
                         eof = false;
+                        eof_reported = false;
+                        decode_buffer.clear();
                         metrics.decoded_eof_generation.store(0, Ordering::Release);
                         metrics.ready_generation.store(0, Ordering::Release);
                     }
@@ -651,14 +719,31 @@ pub(crate) fn spawn_decoder_worker(
                 Ok(WorkerCommand::Replace {
                     path,
                     generation: next_generation,
+                    tempo_settings,
                 }) => match MediaDecoder::open(path)
                     .and_then(|source| EngineRateDecoder::new(source, decoder.target_rate()))
                 {
                     Ok(next_decoder) => {
                         decoder = next_decoder;
+                        tempo = match TempoProcessor::new(
+                            decoder.target_rate(),
+                            decoder.info().channels,
+                            tempo_settings,
+                        ) {
+                            Ok(processor) => processor,
+                            Err(error) => {
+                                store_worker_error(&worker_error, error.to_string());
+                                return;
+                            }
+                        };
+                        metrics
+                            .processor_latency_frames
+                            .store(tempo.latency_frames() as u64, Ordering::Relaxed);
                         generation = next_generation;
                         pending = None;
                         eof = false;
+                        eof_reported = false;
+                        decode_buffer.clear();
                         metrics.decoded_eof_generation.store(0, Ordering::Release);
                         metrics.ready_generation.store(0, Ordering::Release);
                     }
@@ -667,6 +752,25 @@ pub(crate) fn spawn_decoder_worker(
                         return;
                     }
                 },
+                Ok(WorkerCommand::SetTempo(settings)) => {
+                    if let Err(error) = tempo.set_settings(settings) {
+                        store_worker_error(&worker_error, error.to_string());
+                        return;
+                    }
+                    metrics
+                        .tempo_percent_bits
+                        .store(settings.tempo_percent.to_bits(), Ordering::Relaxed);
+                    metrics.key_lock.store(settings.key_lock, Ordering::Relaxed);
+                    metrics
+                        .pitch_semitones_bits
+                        .store(settings.pitch_semitones.to_bits(), Ordering::Relaxed);
+                    metrics
+                        .tempo_ratio_bits
+                        .store(settings.tempo_ratio().to_bits(), Ordering::Relaxed);
+                    metrics
+                        .processor_latency_frames
+                        .store(tempo.latency_frames() as u64, Ordering::Relaxed);
+                }
                 Ok(WorkerCommand::Shutdown) => return,
                 Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => {}
@@ -690,18 +794,46 @@ pub(crate) fn spawn_decoder_worker(
             }
 
             if eof {
+                if !eof_reported {
+                    metrics
+                        .decoded_eof_generation
+                        .store(generation, Ordering::Release);
+                    eof_reported = true;
+                }
                 thread::sleep(Duration::from_millis(2));
                 continue;
             }
 
-            let buffer = recycled.pop().unwrap_or_default();
-            match decoder.next_chunk_into(buffer) {
-                Ok(Some(chunk)) => pending = Some(DecodedBlock { generation, chunk }),
+            match decoder.next_chunk_into(std::mem::take(&mut decode_buffer)) {
+                Ok(Some(chunk)) => {
+                    let ratio = tempo.settings().tempo_ratio();
+                    match tempo.process(chunk, recycled.pop().unwrap_or_default()) {
+                        Ok((processed, input_buffer)) => {
+                            decode_buffer = input_buffer;
+                            if let Some(chunk) = processed {
+                                pending = Some(DecodedBlock {
+                                    generation,
+                                    chunk,
+                                    source_frames_per_output: ratio,
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            store_worker_error(&worker_error, error.to_string());
+                            return;
+                        }
+                    }
+                }
                 Ok(None) => {
+                    let ratio = tempo.settings().tempo_ratio();
+                    if let Some(chunk) = tempo.flush(recycled.pop().unwrap_or_default()) {
+                        pending = Some(DecodedBlock {
+                            generation,
+                            chunk,
+                            source_frames_per_output: ratio,
+                        });
+                    }
                     eof = true;
-                    metrics
-                        .decoded_eof_generation
-                        .store(generation, Ordering::Release);
                 }
                 Err(error) => {
                     store_worker_error(&worker_error, error.to_string());
@@ -741,6 +873,7 @@ mod tests {
                 sample_rate: 44_100,
                 channels: 2,
             },
+            source_frames_per_output: 1.0,
         }
     }
 
@@ -810,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_worker_supports_seek_and_track_replacement() {
+    fn decoder_worker_supports_live_tempo_seek_and_track_replacement() {
         let decoder = EngineRateDecoder::new(
             MediaDecoder::open("tests/fixtures/audio/tone.wav").unwrap(),
             44_100,
@@ -829,10 +962,19 @@ mod tests {
             command_rx,
             Arc::clone(&metrics),
             Arc::clone(&error),
+            TempoSettings::default(),
         );
 
         let first = wait_for_block(&mut output_rx, 1);
         assert_eq!(first.generation, 1);
+        command_tx
+            .send(WorkerCommand::SetTempo(TempoSettings {
+                tempo_percent: 8.0,
+                ..TempoSettings::default()
+            }))
+            .unwrap();
+        let after_tempo = wait_for_block(&mut output_rx, 1);
+        assert_eq!(after_tempo.generation, 1);
         command_tx
             .send(WorkerCommand::Seek {
                 seconds: 1.5,
@@ -845,6 +987,7 @@ mod tests {
             .send(WorkerCommand::Replace {
                 path: PathBuf::from("tests/fixtures/audio/tone.flac"),
                 generation: 3,
+                tempo_settings: TempoSettings::default(),
             })
             .unwrap();
         let replacement = wait_for_block(&mut output_rx, 3);
