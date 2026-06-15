@@ -20,6 +20,31 @@ pub struct OutputDeviceInfo {
     pub limitation: Option<String>,
 }
 
+pub fn validate_dual_output_pair(
+    master: &OutputDeviceInfo,
+    cue: &OutputDeviceInfo,
+) -> Result<(), String> {
+    if master.id == cue.id {
+        return Err("master and cue outputs must be different devices".to_string());
+    }
+    if !master.stereo_master_supported || !cue.stereo_master_supported {
+        return Err("dual-device cue requires two stereo output devices".to_string());
+    }
+    if master.sample_rate != cue.sample_rate {
+        return Err(format!(
+            "dual-device cue requires matching sample rates; master is {} Hz and cue is {} Hz",
+            master.sample_rate, cue.sample_rate
+        ));
+    }
+    if master.interface == "bluetooth" || cue.interface == "bluetooth" {
+        return Err(
+            "Bluetooth dual-device cue is not supported because its latency is unstable"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 pub fn output_devices() -> Result<Vec<OutputDeviceInfo>, Box<dyn Error>> {
     let host = cpal::default_host();
     let default_id = host
@@ -133,6 +158,24 @@ fn interface_name(interface: InterfaceType) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn device(id: &str, channels: u16, rate: u32, interface: &str) -> OutputDeviceInfo {
+        OutputDeviceInfo {
+            id: id.to_string(),
+            name: id.to_string(),
+            is_default: false,
+            interface: interface.to_string(),
+            channels,
+            max_channels: channels,
+            sample_rate: rate,
+            stereo_master_supported: channels >= 2,
+            stereo_cue_supported: channels >= 4,
+            routing_mode: "master-only".to_string(),
+            limitation: None,
+        }
+    }
+
     #[test]
     fn routing_capability_thresholds_are_explicit() {
         for (channels, master, cue) in [
@@ -144,5 +187,22 @@ mod tests {
             assert_eq!(channels >= 2, master);
             assert_eq!(channels >= 4, cue);
         }
+    }
+
+    #[test]
+    fn dual_output_pair_requires_distinct_matching_stereo_devices() {
+        let master = device("master", 2, 44_100, "built-in");
+        let cue = device("cue", 2, 44_100, "unknown");
+        assert_eq!(validate_dual_output_pair(&master, &cue), Ok(()));
+        assert!(validate_dual_output_pair(&master, &master).is_err());
+        assert!(validate_dual_output_pair(&master, &device("mono", 1, 44_100, "usb")).is_err());
+        assert!(
+            validate_dual_output_pair(&master, &device("different-rate", 2, 48_000, "usb"))
+                .is_err()
+        );
+        assert!(
+            validate_dual_output_pair(&master, &device("wireless", 2, 44_100, "bluetooth"))
+                .is_err()
+        );
     }
 }

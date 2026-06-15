@@ -1,6 +1,6 @@
 # ADR-010: Production Dual-Device Cue Routing
 
-- Status: Proposed; owner approval required
+- Status: Approved and implemented; manual hardware acceptance pending
 - Date: 2026-06-14
 - Scope: Separate stereo master and headphone-cue outputs on matching-rate macOS devices
 
@@ -50,7 +50,7 @@ Use the already approved `rtrb` dependency. Add no production dependency.
 
 The queue will be sized from frames, not callback count. The initial target is:
 
-- 1,024-frame prefill, approximately 23.2 ms at 44.1 kHz.
+- 2,048-frame prefill, approximately 46.4 ms at 44.1 kHz.
 - 4,096-frame capacity, approximately 92.9 ms at 44.1 kHz.
 - Low and high watermarks exposed in health telemetry.
 
@@ -162,3 +162,19 @@ Approval authorizes:
 - Tests and target-hardware acceptance work.
 
 Approval does not authorize new dependencies, a database migration, automatic aggregate-device creation, asynchronous resampling, Bluetooth dual-device routing, mono split output, final UI design, or support beyond macOS.
+
+## Implementation Result
+
+The owner approved ADR-010 on 2026-06-14.
+
+- `MixerEngine` can open different matching-rate stereo master and cue devices.
+- The master callback renders both decks once and pushes complete stereo cue frames through a bounded `rtrb` queue.
+- The cue callback only drains queued frames, converts samples, writes silence on underflow, and updates atomics.
+- A 2,048-frame base prefill prevents startup starvation on the target route. Manual delay extends both prefill and queue capacity.
+- Pair validation rejects the same device, mono outputs, mismatched sample rates, and devices identified as Bluetooth.
+- Cue stream errors or repeated queue underflow/overflow stop cue without stopping or redirecting master audio.
+- Existing SQLite settings persist routing mode, cue-device UID, and cue delay without a migration.
+- Tauri snapshots and the interim UI expose routing controls, limitation messages, and queue health.
+- No production dependency was added.
+
+A loaded 30-minute Apple M3 run used MacBook Pro Speakers for master and External Headphones for cue while repeatedly seeking and resampling mixed-rate fixtures. It completed 155,066 master callbacks and 155,068 cue callbacks. Queue depth remained between 512 and 2,048 frames, maximum relative progress deviation was one 512-frame callback quantum, and there were zero underflows, overflows, or stream errors. Loaded stability acceptance passed. Audible delay calibration and physical disconnect/reconnect checks remain required before final production acceptance.

@@ -6,14 +6,14 @@ Read this file before every task and update it after every meaningful change. Ke
 
 ## Current State
 
-- Status: Stage-twelve headphone cue routing implemented; ADR-010 production dual-device cue routing is proposed and awaiting owner approval.
+- Status: Stage-thirteen dual-device cue loaded stability accepted; professional two-deck UI redesign and crossfader-follow cue behavior implemented; manual audio acceptance remains pending.
 - Target: private, offline-first macOS DJ desktop application.
 - Target hardware: Apple M3 Mac.
 - Implementation: reusable Rust engine plus a Tauri 2, React, TypeScript, and Vite macOS application scaffold.
 - Production architecture: approved.
 - Database schema: version 1 created and tested.
 - External APIs: none.
-- Known bugs: none confirmed. Physical channels 3–4 cue output has not yet been tested because no four-channel device or aggregate device is currently available.
+- Known bugs: none confirmed. Physical channels 3–4 cue output has not yet been tested because no four-channel device or aggregate device is currently available. External Headphones can receive nonzero cue samples; audible volume still requires manual confirmation.
 
 ## Confirmed Product Decisions
 
@@ -103,8 +103,8 @@ Reasoning: a desktop application is better suited than a browser application for
 ## Next Meaningful Tasks
 
 1. Complete physical cue acceptance with a four-channel interface or user-created macOS aggregate device.
-2. Review and approve or reject ADR-010 for production dual-device cue routing with shared buffering, manual latency offset, and device-loss recovery.
-3. Continue with the next core DJ control milestone after owner approval.
+2. Complete ADR-010 manual acceptance: audible latency calibration and physical cue/master device-loss recovery.
+3. Continue with the next core DJ control milestone after dual-device acceptance.
 
 ### 2026-06-13 - Dependency Architecture Evaluation
 
@@ -294,6 +294,42 @@ Reasoning: a desktop application is better suited than a browser application for
 - Reason: The 30-minute speaker/headphone spike showed no accumulating frame drift, making a carefully bounded production implementation credible on the target Mac, while fixed latency, loaded buffering, and device loss still require explicit controls and tests.
 - Verification: Reconciled the proposal with ADR-008 recovery, ADR-009 cue privacy and single-device preference, the measured 512-frame scheduling jitter, current approved dependencies, and the existing SQLite settings model. No production code, dependency, schema, or established UI change was made.
 - Follow-up: Owner approval is required before implementing ADR-010.
+
+### 2026-06-14 - Stage-Thirteen Dual-Device Cue Routing Implemented
+
+- Type: completed
+- Status: completed
+- Change: The owner approved ADR-010. Added matching-rate separate master/cue streams, master-clock stereo cue fanout through a bounded lock-free frame queue, manual 0-250 ms cue delay, pair validation, queue telemetry, persisted routing preferences, Tauri commands, interim UI controls, and fail-closed cue recovery that preserves master playback. No dependency or schema migration was added.
+- Reason: The target Mac exposes built-in speakers and wired headphones as separate stereo devices, and the earlier 30-minute synchronization spike showed no accumulating frame drift.
+- Verification: Forty engine/CLI tests and the default Tauri test pass; two CoreAudio tests remain ignored by default. Formatting, Rust Clippy with warnings denied, Tauri Clippy, the frontend production build, and integrated debug app bundling pass. A direct loaded two-deck Apple M3 run completed 261 master and 263 cue callbacks with queue depth bounded between 512 and 2,048 frames and zero underflows, overflows, or stream errors.
+- Follow-up: Complete the 30-minute loaded run, audible cue-delay calibration, and physical headphone/master disconnect recovery checklist in `docs/testing/dual-device-cue-routing.md`.
+
+### 2026-06-14 - Dual-Device Loaded Stability Accepted
+
+- Type: completed
+- Status: completed
+- Change: Extended the ignored CoreAudio test into a duration-controlled loaded soak harness. It repeatedly seeks mixed-rate fixtures to keep both decoder/resampler pipelines active, tracks master and cue rendered frames, samples queue depth, and fails immediately on stream errors, cue underflow, cue overflow, or lost routing.
+- Reason: The previous three-second test did not satisfy ADR-010's loaded 30-minute stability requirement.
+- Verification: The 1,800-second Apple M3 run completed 155,066 master callbacks and 155,068 cue callbacks. It rendered 79,393,792 master frames and 79,394,816 cue frames; queue depth stayed between 512 and 2,048 frames, maximum relative deviation was one 512-frame callback quantum, and stream errors, cue underflows, and cue overflows all remained zero.
+- Follow-up: Complete the interactive audible cue controls/delay check and physical cue/master disconnect recovery checklist. Loaded dual-device stability is accepted.
+
+### 2026-06-14 - Professional Two-Deck UI And Automatic Cue
+
+- Type: completed
+- Status: completed
+- Change: Rebuilt the interim interface around two track headers, waveform strips, original CSS-rendered platters, channel controls, a compact center mixer, a horizontal crossfader, audio-routing disclosure, and a dense lower library/AutoMix workspace inspired by the owner-provided reference without copying its branding or assets. Moving the crossfader left now cues Deck B, moving it right cues Deck A, and the center dead zone clears automatic cue because both decks are on master.
+- Reason: The owner approved a professional two-deck visual direction and requested that the deck outside the crossfader mix be selected automatically for headphone cue.
+- Verification: Forty engine/CLI tests and two default Tauri tests pass; the automatic cue thresholds have a deterministic service test. The TypeScript and Vite production build passes. Manual cue controls remain available until the next crossfader movement.
+- Follow-up: Launch the redesigned app for visual review and complete audible cue/delay and physical device-loss acceptance.
+
+### 2026-06-14 - Headphone Cue Signal Diagnostic
+
+- Type: bug
+- Status: completed
+- Change: Restored visible Cue Level and Cue/Master blend controls removed during the UI redesign, and added peak-amplitude telemetry from samples consumed by the cue-device callback. Updated the hardware test to use low nonzero gains and automatic Deck B cue instead of testing only silence.
+- Reason: External Headphones were detected but the owner could not hear the cued track, while the previous stability test had deliberately muted every signal and could not distinguish a live silent stream from real cue audio.
+- Verification: A five-second direct CoreAudio run measured a nonzero cue peak of `0.00062491273` with 441 master callbacks, 443 cue callbacks, and zero stream errors, underflows, or overflows. Rust tests and the frontend production build pass.
+- Follow-up: In the app, set Cue Level above zero and Cue/Master toward Cue. If the live cue-signal indicator is active but headphones remain silent, verify the macOS volume for External Headphones.
 
 ## Update Template
 

@@ -33,3 +33,30 @@ The test loads 48 kHz WAV on Deck A and 96 kHz WAV on Deck B, mutes both channel
 3. Load tracks into both decks and use play, pause, seek, and stop independently.
 4. Move Deck A gain, Deck B gain, master gain, and the crossfader.
 5. Confirm the health counters continue updating and errors remain zero.
+## 2026-06-14 Visual Revision
+
+The owner-approved interface direction uses an original professional DJ layout with:
+
+- Two large deck surfaces with track headers, progress waveforms, platter visualization, transport controls, gain, and simplified EQ/filter placeholders.
+- A compact center mixer and a horizontal crossfader below both decks.
+- Audio-device and cue-routing controls in a collapsible top panel.
+- A dense lower local-library browser and a clearly marked future AutoMix panel.
+- Light and dark theme support without copied third-party branding or visual assets.
+
+## Automatic Cue Behavior
+
+- Crossfader below `-0.05`: Deck A is on master and Deck B is automatically cued.
+- Crossfader above `0.05`: Deck B is on master and Deck A is automatically cued.
+- Crossfader from `-0.05` through `0.05`: both decks are on master and automatic cue is cleared.
+- Manual Cue A/B controls may override the current selection until the crossfader moves again.
+- Cue remains capability-gated and can never be routed into a two-channel master output.
+
+## Verification
+
+```sh
+cargo test --all-targets
+cargo test --manifest-path src-tauri/Cargo.toml
+npm run build
+```
+
+Manual visual review should cover laptop sizing, long track names, empty library state, both themes, disabled cue routing, and separate-device cue health text.

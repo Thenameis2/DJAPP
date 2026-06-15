@@ -15,13 +15,19 @@ use tauri::Manager;
 
 mod mixer_service;
 
-use mixer_service::{CuePreferences, DeckServiceSnapshot, MixerService, MixerServiceSnapshot};
+use mixer_service::{
+    CuePreferences, DeckServiceSnapshot, MixerService, MixerServiceSnapshot, RoutingMode,
+    RoutingPreferences,
+};
 
 const OUTPUT_DEVICE_SETTING: &str = "audio.output_device_id";
 const CUE_A_SETTING: &str = "audio.cue_a";
 const CUE_B_SETTING: &str = "audio.cue_b";
 const CUE_BLEND_SETTING: &str = "audio.cue_blend";
 const CUE_GAIN_SETTING: &str = "audio.cue_gain";
+const ROUTING_MODE_SETTING: &str = "audio.routing_mode";
+const CUE_OUTPUT_DEVICE_SETTING: &str = "audio.cue_output_device_id";
+const CUE_DELAY_SETTING: &str = "audio.cue_delay_ms";
 
 struct AppState {
     persistence: Arc<PersistenceWorker>,
@@ -104,6 +110,7 @@ struct DeckView {
     channels: Option<usize>,
     state: &'static str,
     callbacks: u64,
+    rendered_frames: u64,
     underflow_callbacks: u64,
     stale_blocks: u64,
     recycle_failures: u64,
@@ -132,6 +139,7 @@ impl From<DeckServiceSnapshot> for DeckView {
                 djapp_audio_spike::deck::DeckState::Ended => "ended",
             },
             callbacks: snapshot.callbacks,
+            rendered_frames: snapshot.rendered_frames,
             underflow_callbacks: snapshot.underflow_callbacks,
             stale_blocks: snapshot.stale_blocks,
             recycle_failures: snapshot.recycle_failures,
@@ -151,6 +159,7 @@ struct MixerView {
     channel_gain_b: f32,
     master_gain: f32,
     callbacks: u64,
+    rendered_frames: u64,
     clipped_samples: u64,
     stream_errors: u64,
     output_device_id: Option<String>,
@@ -163,7 +172,20 @@ struct MixerView {
     cue_gain: f32,
     cue_supported: bool,
     routing_mode: String,
+    routing_preference: String,
     routing_limitation: Option<String>,
+    cue_output_device_id: Option<String>,
+    cue_output_device_name: Option<String>,
+    cue_delay_ms: u32,
+    cue_callbacks: u64,
+    cue_rendered_frames: u64,
+    cue_queue_depth_frames: u64,
+    cue_min_queue_depth_frames: u64,
+    cue_max_queue_depth_frames: u64,
+    cue_underflow_callbacks: u64,
+    cue_overflow_callbacks: u64,
+    cue_stream_errors: u64,
+    cue_signal_peak: f32,
 }
 
 impl From<MixerServiceSnapshot> for MixerView {
@@ -176,6 +198,7 @@ impl From<MixerServiceSnapshot> for MixerView {
             channel_gain_b: snapshot.channel_gain_b,
             master_gain: snapshot.master_gain,
             callbacks: snapshot.callbacks,
+            rendered_frames: snapshot.rendered_frames,
             clipped_samples: snapshot.clipped_samples,
             stream_errors: snapshot.stream_errors,
             output_device_id: snapshot.output_device_id,
@@ -188,7 +211,20 @@ impl From<MixerServiceSnapshot> for MixerView {
             cue_gain: snapshot.cue_gain,
             cue_supported: snapshot.cue_supported,
             routing_mode: snapshot.routing_mode,
+            routing_preference: snapshot.routing_preference,
             routing_limitation: snapshot.routing_limitation,
+            cue_output_device_id: snapshot.cue_output_device_id,
+            cue_output_device_name: snapshot.cue_output_device_name,
+            cue_delay_ms: snapshot.cue_delay_ms,
+            cue_callbacks: snapshot.cue_callbacks,
+            cue_rendered_frames: snapshot.cue_rendered_frames,
+            cue_queue_depth_frames: snapshot.cue_queue_depth_frames,
+            cue_min_queue_depth_frames: snapshot.cue_min_queue_depth_frames,
+            cue_max_queue_depth_frames: snapshot.cue_max_queue_depth_frames,
+            cue_underflow_callbacks: snapshot.cue_underflow_callbacks,
+            cue_overflow_callbacks: snapshot.cue_overflow_callbacks,
+            cue_stream_errors: snapshot.cue_stream_errors,
+            cue_signal_peak: snapshot.cue_signal_peak,
         }
     }
 }
@@ -280,6 +316,52 @@ async fn audio_select_output_device(
         .set_setting(OUTPUT_DEVICE_SETTING.to_string(), device_id, updated_at_ms)
         .map_err(|error| error.to_string())?;
     Ok(snapshot.into())
+}
+
+#[tauri::command]
+async fn audio_select_cue_output_device(
+    device_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<MixerView, String> {
+    let mixer = Arc::clone(&state.mixer);
+    let selected = device_id.clone();
+    let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        mixer.select_cue_output_device(selected)
+    })
+    .await
+    .map_err(|error| format!("mixer worker failed: {error}"))??;
+    persist_mixer_setting(&state, CUE_OUTPUT_DEVICE_SETTING, device_id).await?;
+    Ok(snapshot.into())
+}
+
+#[tauri::command]
+async fn audio_set_routing_mode(
+    mode: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<MixerView, String> {
+    let parsed = RoutingMode::parse(&mode)?;
+    let view = mixer_command(
+        move |mixer| mixer.set_routing_mode(parsed),
+        Arc::clone(&state.mixer),
+    )
+    .await?;
+    persist_mixer_setting(&state, ROUTING_MODE_SETTING, mode).await?;
+    Ok(view)
+}
+
+#[tauri::command]
+async fn audio_set_cue_delay_ms(
+    delay_ms: u32,
+    state: tauri::State<'_, AppState>,
+) -> Result<MixerView, String> {
+    let delay_ms = delay_ms.min(250);
+    let view = mixer_command(
+        move |mixer| mixer.set_cue_delay(delay_ms),
+        Arc::clone(&state.mixer),
+    )
+    .await?;
+    persist_mixer_setting(&state, CUE_DELAY_SETTING, delay_ms.to_string()).await?;
+    Ok(view)
 }
 
 fn indexed_track(
@@ -532,8 +614,26 @@ pub fn run() {
                 blend: setting_f32(&persistence, CUE_BLEND_SETTING, -1.0)?,
                 gain: setting_f32(&persistence, CUE_GAIN_SETTING, 0.5)?,
             };
-            let mixer = MixerService::start(preferred_output_device, cue_preferences)
-                .map_err(std::io::Error::other)?;
+            let routing_preferences = RoutingPreferences {
+                mode: persistence
+                    .setting(ROUTING_MODE_SETTING.to_string())
+                    .map_err(std::io::Error::other)?
+                    .as_deref()
+                    .map(RoutingMode::parse)
+                    .transpose()
+                    .map_err(std::io::Error::other)?
+                    .unwrap_or(RoutingMode::Automatic),
+                cue_output_device_id: persistence
+                    .setting(CUE_OUTPUT_DEVICE_SETTING.to_string())
+                    .map_err(std::io::Error::other)?,
+                cue_delay_ms: setting_u32(&persistence, CUE_DELAY_SETTING, 0)?.min(250),
+            };
+            let mixer = MixerService::start(
+                preferred_output_device,
+                cue_preferences,
+                routing_preferences,
+            )
+            .map_err(std::io::Error::other)?;
             app.manage(AppState {
                 persistence: Arc::new(persistence),
                 mixer: Arc::new(mixer),
@@ -546,6 +646,9 @@ pub fn run() {
             library_tracks,
             audio_output_devices,
             audio_select_output_device,
+            audio_select_cue_output_device,
+            audio_set_routing_mode,
+            audio_set_cue_delay_ms,
             deck_a_load,
             deck_b_load,
             deck_a_play,
@@ -592,5 +695,17 @@ fn setting_f32(
         .map_err(std::io::Error::other)?
         .and_then(|value| value.parse().ok())
         .filter(|value: &f32| value.is_finite())
+        .unwrap_or(fallback))
+}
+
+fn setting_u32(
+    persistence: &PersistenceWorker,
+    key: &str,
+    fallback: u32,
+) -> Result<u32, std::io::Error> {
+    Ok(persistence
+        .setting(key.to_string())
+        .map_err(std::io::Error::other)?
+        .and_then(|value| value.parse().ok())
         .unwrap_or(fallback))
 }

@@ -23,6 +23,7 @@ pub struct DeckServiceSnapshot {
     pub state: DeckState,
     pub position_frames: u64,
     pub callbacks: u64,
+    pub rendered_frames: u64,
     pub underflow_callbacks: u64,
     pub stale_blocks: u64,
     pub recycle_failures: u64,
@@ -39,6 +40,7 @@ pub struct MixerServiceSnapshot {
     pub channel_gain_b: f32,
     pub master_gain: f32,
     pub callbacks: u64,
+    pub rendered_frames: u64,
     pub clipped_samples: u64,
     pub stream_errors: u64,
     pub output_device_id: Option<String>,
@@ -51,7 +53,20 @@ pub struct MixerServiceSnapshot {
     pub cue_gain: f32,
     pub cue_supported: bool,
     pub routing_mode: String,
+    pub routing_preference: String,
     pub routing_limitation: Option<String>,
+    pub cue_output_device_id: Option<String>,
+    pub cue_output_device_name: Option<String>,
+    pub cue_delay_ms: u32,
+    pub cue_callbacks: u64,
+    pub cue_rendered_frames: u64,
+    pub cue_queue_depth_frames: u64,
+    pub cue_min_queue_depth_frames: u64,
+    pub cue_max_queue_depth_frames: u64,
+    pub cue_underflow_callbacks: u64,
+    pub cue_overflow_callbacks: u64,
+    pub cue_stream_errors: u64,
+    pub cue_signal_peak: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -69,6 +84,49 @@ impl Default for CuePreferences {
             cue_b: false,
             blend: -1.0,
             gain: 0.5,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutingMode {
+    Automatic,
+    MasterOnly,
+    DualDeviceCue,
+}
+
+impl RoutingMode {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "automatic" => Ok(Self::Automatic),
+            "master-only" => Ok(Self::MasterOnly),
+            "dual-device-cue" => Ok(Self::DualDeviceCue),
+            _ => Err("unknown audio routing mode".to_string()),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::MasterOnly => "master-only",
+            Self::DualDeviceCue => "dual-device-cue",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RoutingPreferences {
+    pub mode: RoutingMode,
+    pub cue_output_device_id: Option<String>,
+    pub cue_delay_ms: u32,
+}
+
+impl Default for RoutingPreferences {
+    fn default() -> Self {
+        Self {
+            mode: RoutingMode::Automatic,
+            cue_output_device_id: None,
+            cue_delay_ms: 0,
         }
     }
 }
@@ -138,6 +196,18 @@ enum Command {
         device_id: String,
         response: Response,
     },
+    SelectCueOutputDevice {
+        device_id: String,
+        response: Response,
+    },
+    SetRoutingMode {
+        mode: RoutingMode,
+        response: Response,
+    },
+    SetCueDelay {
+        delay_ms: u32,
+        response: Response,
+    },
     Snapshot {
         response: Response,
     },
@@ -153,11 +223,19 @@ impl MixerService {
     pub fn start(
         preferred_output_device: Option<String>,
         cue_preferences: CuePreferences,
+        routing_preferences: RoutingPreferences,
     ) -> Result<Self, String> {
         let (sender, receiver) = mpsc::channel();
         let join = thread::Builder::new()
             .name("djapp-mixer-service".to_string())
-            .spawn(move || run(receiver, preferred_output_device, cue_preferences))
+            .spawn(move || {
+                run(
+                    receiver,
+                    preferred_output_device,
+                    cue_preferences,
+                    routing_preferences,
+                )
+            })
             .map_err(|error| format!("failed to start mixer service: {error}"))?;
         Ok(Self {
             sender,
@@ -238,6 +316,27 @@ impl MixerService {
         })
     }
 
+    pub fn select_cue_output_device(
+        &self,
+        device_id: String,
+    ) -> Result<MixerServiceSnapshot, String> {
+        if device_id.is_empty() {
+            return Err("select a headphone cue output".to_string());
+        }
+        self.request(|response| Command::SelectCueOutputDevice {
+            device_id,
+            response,
+        })
+    }
+
+    pub fn set_routing_mode(&self, mode: RoutingMode) -> Result<MixerServiceSnapshot, String> {
+        self.request(|response| Command::SetRoutingMode { mode, response })
+    }
+
+    pub fn set_cue_delay(&self, delay_ms: u32) -> Result<MixerServiceSnapshot, String> {
+        self.request(|response| Command::SetCueDelay { delay_ms, response })
+    }
+
     pub fn set_cue(&self, deck: DeckId, enabled: bool) -> Result<MixerServiceSnapshot, String> {
         self.request(|response| Command::SetCue {
             deck,
@@ -283,6 +382,7 @@ fn run(
     receiver: Receiver<Command>,
     preferred_output_device: Option<String>,
     mut cue: CuePreferences,
+    mut routing: RoutingPreferences,
 ) {
     let mut engine: Option<MixerEngine> = None;
     let mut loaded_a: Option<LoadedTrack> = None;
@@ -308,7 +408,7 @@ fn run(
             } => {
                 let result = (|| {
                     if engine.is_none() {
-                        match open_engine(output_device_id.as_deref()) {
+                        match open_engine(output_device_id.as_deref(), &routing) {
                             Ok(next) => engine = Some(next),
                             Err(preferred_error) if output_device_id.is_some() => {
                                 let next = MixerEngine::open_default_unloaded()
@@ -327,7 +427,7 @@ fn run(
                             }
                             Err(error) => return Err(error),
                         }
-                        apply_cue_preferences(engine.as_mut().unwrap(), cue)?;
+                        apply_automatic_cue(engine.as_mut().unwrap(), crossfader, &mut cue)?;
                     }
                     engine
                         .as_mut()
@@ -352,6 +452,7 @@ fn run(
                         channel_gain_b,
                         master_gain,
                         cue,
+                        &routing,
                         output_device_id.as_deref(),
                         output_device_name.as_deref(),
                         device_recoveries,
@@ -371,6 +472,7 @@ fn run(
                 channel_gain_b,
                 master_gain,
                 cue,
+                &routing,
                 output_device_id.as_deref(),
                 output_device_name.as_deref(),
                 device_recoveries,
@@ -387,6 +489,7 @@ fn run(
                 channel_gain_b,
                 master_gain,
                 cue,
+                &routing,
                 output_device_id.as_deref(),
                 output_device_name.as_deref(),
                 device_recoveries,
@@ -408,6 +511,7 @@ fn run(
                 channel_gain_b,
                 master_gain,
                 cue,
+                &routing,
                 output_device_id.as_deref(),
                 output_device_name.as_deref(),
                 device_recoveries,
@@ -424,6 +528,7 @@ fn run(
                 channel_gain_b,
                 master_gain,
                 cue,
+                &routing,
                 output_device_id.as_deref(),
                 output_device_name.as_deref(),
                 device_recoveries,
@@ -460,6 +565,7 @@ fn run(
                             channel_gain_b,
                             master_gain,
                             cue,
+                            &routing,
                             output_device_id.as_deref(),
                             output_device_name.as_deref(),
                             device_recoveries,
@@ -479,7 +585,8 @@ fn run(
                     .and_then(|engine| {
                         engine
                             .set_crossfader(value)
-                            .map_err(|error| error.to_string())
+                            .map_err(|error| error.to_string())?;
+                        apply_automatic_cue(engine, value, &mut cue)
                     });
                 if result.is_ok() {
                     crossfader = value.clamp(-1.0, 1.0);
@@ -495,6 +602,7 @@ fn run(
                             channel_gain_b,
                             master_gain,
                             cue,
+                            &routing,
                             output_device_id.as_deref(),
                             output_device_name.as_deref(),
                             device_recoveries,
@@ -530,6 +638,7 @@ fn run(
                             channel_gain_b,
                             master_gain,
                             cue,
+                            &routing,
                             output_device_id.as_deref(),
                             output_device_name.as_deref(),
                             device_recoveries,
@@ -567,6 +676,7 @@ fn run(
                         channel_gain_b,
                         master_gain,
                         cue,
+                        &routing,
                         output_device_id.as_deref(),
                         output_device_name.as_deref(),
                         device_recoveries,
@@ -593,6 +703,7 @@ fn run(
                         channel_gain_b,
                         master_gain,
                         cue,
+                        &routing,
                         output_device_id.as_deref(),
                         output_device_name.as_deref(),
                         device_recoveries,
@@ -619,6 +730,7 @@ fn run(
                         channel_gain_b,
                         master_gain,
                         cue,
+                        &routing,
                         output_device_id.as_deref(),
                         output_device_name.as_deref(),
                         device_recoveries,
@@ -642,9 +754,10 @@ fn run(
                         channel_gain_b,
                         master_gain,
                         cue,
+                        &routing,
                     )
                 } else {
-                    open_engine(Some(&device_id)).map(drop)
+                    open_engine(Some(&device_id), &routing).map(drop)
                 };
                 if result.is_ok() {
                     output_device_name = device_name(Some(&device_id));
@@ -674,6 +787,146 @@ fn run(
                         channel_gain_b,
                         master_gain,
                         cue,
+                        &routing,
+                        output_device_id.as_deref(),
+                        output_device_name.as_deref(),
+                        device_recoveries,
+                        device_message.as_deref(),
+                    )
+                }));
+                continue;
+            }
+            Command::SelectCueOutputDevice {
+                device_id,
+                response,
+            } => {
+                let mut candidate = routing.clone();
+                candidate.cue_output_device_id = Some(device_id.clone());
+                let result = if engine.is_some() && candidate.mode == RoutingMode::DualDeviceCue {
+                    restart_engine(
+                        &mut engine,
+                        output_device_id.as_deref(),
+                        &loaded_a,
+                        &loaded_b,
+                        crossfader,
+                        channel_gain_a,
+                        channel_gain_b,
+                        master_gain,
+                        cue,
+                        &candidate,
+                    )
+                } else {
+                    Ok(())
+                };
+                if result.is_ok() {
+                    routing = candidate;
+                    device_message = Some(format!(
+                        "Cue output selected: {}.",
+                        device_name(Some(&device_id)).as_deref().unwrap_or("selected device")
+                    ));
+                }
+                let _ = response.send(result.map(|()| {
+                    snapshot(
+                        engine.as_ref(),
+                        loaded_a.as_ref(),
+                        loaded_b.as_ref(),
+                        crossfader,
+                        channel_gain_a,
+                        channel_gain_b,
+                        master_gain,
+                        cue,
+                        &routing,
+                        output_device_id.as_deref(),
+                        output_device_name.as_deref(),
+                        device_recoveries,
+                        device_message.as_deref(),
+                    )
+                }));
+                continue;
+            }
+            Command::SetRoutingMode { mode, response } => {
+                let mut candidate = routing.clone();
+                candidate.mode = mode;
+                let result = if engine.is_some() {
+                    restart_engine(
+                        &mut engine,
+                        output_device_id.as_deref(),
+                        &loaded_a,
+                        &loaded_b,
+                        crossfader,
+                        channel_gain_a,
+                        channel_gain_b,
+                        master_gain,
+                        cue,
+                        &candidate,
+                    )
+                } else if mode == RoutingMode::DualDeviceCue
+                    && candidate.cue_output_device_id.is_none()
+                {
+                    Err("select a cue output before enabling dual-device cue".to_string())
+                } else {
+                    Ok(())
+                };
+                if result.is_ok() {
+                    routing = candidate;
+                    device_message = Some(format!(
+                        "Audio routing changed to {}.",
+                        routing.mode.as_str()
+                    ));
+                }
+                let _ = response.send(result.map(|()| {
+                    snapshot(
+                        engine.as_ref(),
+                        loaded_a.as_ref(),
+                        loaded_b.as_ref(),
+                        crossfader,
+                        channel_gain_a,
+                        channel_gain_b,
+                        master_gain,
+                        cue,
+                        &routing,
+                        output_device_id.as_deref(),
+                        output_device_name.as_deref(),
+                        device_recoveries,
+                        device_message.as_deref(),
+                    )
+                }));
+                continue;
+            }
+            Command::SetCueDelay { delay_ms, response } => {
+                let delay_ms = delay_ms.min(250);
+                let mut candidate = routing.clone();
+                candidate.cue_delay_ms = delay_ms;
+                let result = if engine.is_some() && candidate.mode == RoutingMode::DualDeviceCue {
+                    restart_engine(
+                        &mut engine,
+                        output_device_id.as_deref(),
+                        &loaded_a,
+                        &loaded_b,
+                        crossfader,
+                        channel_gain_a,
+                        channel_gain_b,
+                        master_gain,
+                        cue,
+                        &candidate,
+                    )
+                } else {
+                    Ok(())
+                };
+                if result.is_ok() {
+                    routing = candidate;
+                }
+                let _ = response.send(result.map(|()| {
+                    snapshot(
+                        engine.as_ref(),
+                        loaded_a.as_ref(),
+                        loaded_b.as_ref(),
+                        crossfader,
+                        channel_gain_a,
+                        channel_gain_b,
+                        master_gain,
+                        cue,
+                        &routing,
                         output_device_id.as_deref(),
                         output_device_name.as_deref(),
                         device_recoveries,
@@ -683,6 +936,31 @@ fn run(
                 continue;
             }
             Command::Snapshot { response } => {
+                let cue_health = engine
+                    .as_ref()
+                    .and_then(|engine| engine.snapshot().dual_cue)
+                    .map(|cue| {
+                        (
+                            cue.stream_errors,
+                            cue.underflow_callbacks,
+                            cue.overflow_callbacks,
+                        )
+                    })
+                    .unwrap_or((0, 0, 0));
+                if (cue_health.0 > 0 || cue_health.1 >= 3 || cue_health.2 >= 3)
+                    && engine
+                        .as_mut()
+                        .map(MixerEngine::disable_dual_cue)
+                        .unwrap_or(false)
+                {
+                    device_message = Some(if cue_health.0 > 0 {
+                        "Headphone cue stopped after a cue-device error; master playback continues."
+                            .to_string()
+                    } else {
+                        "Headphone cue stopped after repeated buffer instability; master playback continues."
+                            .to_string()
+                    });
+                }
                 let current_errors = engine
                     .as_ref()
                     .map(|engine| engine.snapshot().stream_errors)
@@ -699,6 +977,7 @@ fn run(
                         channel_gain_b,
                         master_gain,
                         cue,
+                        &routing,
                     );
                     match recovery {
                         Ok(()) => {
@@ -741,6 +1020,7 @@ fn run(
                     channel_gain_b,
                     master_gain,
                     cue,
+                    &routing,
                     output_device_id.as_deref(),
                     output_device_name.as_deref(),
                     device_recoveries,
@@ -767,6 +1047,7 @@ fn respond<E>(
     channel_gain_b: f32,
     master_gain: f32,
     cue: CuePreferences,
+    routing: &RoutingPreferences,
     output_device_id: Option<&str>,
     output_device_name: Option<&str>,
     device_recoveries: u64,
@@ -792,6 +1073,7 @@ where
                         channel_gain_b,
                         master_gain,
                         cue,
+                        routing,
                         output_device_id,
                         output_device_name,
                         device_recoveries,
@@ -813,6 +1095,7 @@ fn unloaded() -> DeckServiceSnapshot {
         state: DeckState::Paused,
         position_frames: 0,
         callbacks: 0,
+        rendered_frames: 0,
         underflow_callbacks: 0,
         stale_blocks: 0,
         recycle_failures: 0,
@@ -836,6 +1119,7 @@ fn deck_snapshot(
         state,
         position_frames,
         callbacks,
+        rendered_frames,
         underflow_callbacks,
         stale_blocks,
         recycle_failures,
@@ -856,6 +1140,7 @@ fn deck_snapshot(
         state,
         position_frames,
         callbacks,
+        rendered_frames,
         underflow_callbacks,
         stale_blocks,
         recycle_failures,
@@ -874,6 +1159,7 @@ fn snapshot(
     channel_gain_b: f32,
     master_gain: f32,
     cue: CuePreferences,
+    routing: &RoutingPreferences,
     output_device_id: Option<&str>,
     output_device_name: Option<&str>,
     device_recoveries: u64,
@@ -888,6 +1174,7 @@ fn snapshot(
             channel_gain_b,
             master_gain,
             callbacks: 0,
+            rendered_frames: 0,
             clipped_samples: 0,
             stream_errors: 0,
             output_device_id: output_device_id.map(str::to_string),
@@ -899,13 +1186,27 @@ fn snapshot(
             cue_blend: cue.blend,
             cue_gain: cue.gain,
             cue_supported: false,
-            routing_mode: "master-only".to_string(),
+            routing_mode: routing.mode.as_str().to_string(),
+            routing_preference: routing.mode.as_str().to_string(),
             routing_limitation: Some(
                 "Load a track to open the selected output and detect cue capability.".to_string(),
             ),
+            cue_output_device_id: routing.cue_output_device_id.clone(),
+            cue_output_device_name: device_name(routing.cue_output_device_id.as_deref()),
+            cue_delay_ms: routing.cue_delay_ms,
+            cue_callbacks: 0,
+            cue_rendered_frames: 0,
+            cue_queue_depth_frames: 0,
+            cue_min_queue_depth_frames: 0,
+            cue_max_queue_depth_frames: 0,
+            cue_underflow_callbacks: 0,
+            cue_overflow_callbacks: 0,
+            cue_stream_errors: 0,
+            cue_signal_peak: 0.0,
         };
     };
     let mixer = engine.snapshot();
+    let dual = mixer.dual_cue.as_ref();
     MixerServiceSnapshot {
         deck_a: deck_snapshot(engine, DeckId::A, loaded_a),
         deck_b: deck_snapshot(engine, DeckId::B, loaded_b),
@@ -914,6 +1215,7 @@ fn snapshot(
         channel_gain_b,
         master_gain,
         callbacks: mixer.callbacks,
+        rendered_frames: mixer.rendered_frames,
         clipped_samples: mixer.clipped_samples,
         stream_errors: mixer.stream_errors,
         output_device_id: output_device_id.map(str::to_string),
@@ -925,21 +1227,63 @@ fn snapshot(
         cue_blend: cue.blend,
         cue_gain: cue.gain,
         cue_supported: engine.cue_supported(),
-        routing_mode: if engine.cue_supported() {
-            "master-and-cue"
+        routing_mode: if dual.is_some() {
+            "dual-device-cue"
+        } else if engine.cue_supported() {
+            "single-device-cue"
         } else {
             "master-only"
         }
         .to_string(),
+        routing_preference: routing.mode.as_str().to_string(),
         routing_limitation: (!engine.cue_supported()).then(|| {
-            "Stereo headphone cue requires one output device with at least four channels."
-                .to_string()
+            if dual.is_some() {
+                "Dual-device cue stopped; master playback remains active.".to_string()
+            } else {
+                "Stereo headphone cue requires a four-channel output or an approved dual-device pair."
+                    .to_string()
+            }
         }),
+        cue_output_device_id: routing.cue_output_device_id.clone(),
+        cue_output_device_name: device_name(routing.cue_output_device_id.as_deref()),
+        cue_delay_ms: routing.cue_delay_ms,
+        cue_callbacks: dual.map(|value| value.callbacks).unwrap_or(0),
+        cue_rendered_frames: dual.map(|value| value.rendered_frames).unwrap_or(0),
+        cue_queue_depth_frames: dual.map(|value| value.queue_depth_frames).unwrap_or(0),
+        cue_min_queue_depth_frames: dual
+            .map(|value| value.min_queue_depth_frames)
+            .unwrap_or(0),
+        cue_max_queue_depth_frames: dual
+            .map(|value| value.max_queue_depth_frames)
+            .unwrap_or(0),
+        cue_underflow_callbacks: dual
+            .map(|value| value.underflow_callbacks)
+            .unwrap_or(0),
+        cue_overflow_callbacks: dual
+            .map(|value| value.overflow_callbacks)
+            .unwrap_or(0),
+        cue_stream_errors: dual.map(|value| value.stream_errors).unwrap_or(0),
+        cue_signal_peak: dual.map(|value| value.signal_peak).unwrap_or(0.0),
     }
 }
 
-fn open_engine(device_id: Option<&str>) -> Result<MixerEngine, String> {
-    MixerEngine::open_output_device_unloaded(device_id).map_err(|error| error.to_string())
+fn open_engine(
+    device_id: Option<&str>,
+    routing: &RoutingPreferences,
+) -> Result<MixerEngine, String> {
+    if routing.mode == RoutingMode::DualDeviceCue {
+        let master = device_id.ok_or_else(|| {
+            "select a master output before enabling dual-device cue".to_string()
+        })?;
+        let cue = routing
+            .cue_output_device_id
+            .as_deref()
+            .ok_or_else(|| "select a cue output before enabling dual-device cue".to_string())?;
+        MixerEngine::open_dual_output_devices_unloaded(master, cue, routing.cue_delay_ms)
+            .map_err(|error| error.to_string())
+    } else {
+        MixerEngine::open_output_device_unloaded(device_id).map_err(|error| error.to_string())
+    }
 }
 
 fn device_name(device_id: Option<&str>) -> Option<String> {
@@ -970,6 +1314,7 @@ fn restart_engine(
     channel_gain_b: f32,
     master_gain: f32,
     cue: CuePreferences,
+    routing: &RoutingPreferences,
 ) -> Result<(), String> {
     let previous = engine.take();
     let previous_snapshot = previous.as_ref().map(MixerEngine::snapshot);
@@ -998,6 +1343,7 @@ fn restart_engine(
         channel_gain_b,
         master_gain,
         cue,
+        routing,
     );
     match primary {
         Ok(next) => {
@@ -1015,6 +1361,7 @@ fn restart_engine(
                 channel_gain_b,
                 master_gain,
                 cue,
+                &RoutingPreferences::default(),
             ) {
                 Ok(fallback) => {
                     *engine = Some(fallback);
@@ -1042,8 +1389,9 @@ fn build_restored_engine(
     channel_gain_b: f32,
     master_gain: f32,
     cue: CuePreferences,
+    routing: &RoutingPreferences,
 ) -> Result<MixerEngine, String> {
-    let mut next = open_engine(device_id)?;
+    let mut next = open_engine(device_id, routing)?;
     restore_deck(
         &mut next,
         DeckId::A,
@@ -1068,8 +1416,30 @@ fn build_restored_engine(
         .map_err(|error| error.to_string())?;
     next.set_master_gain(master_gain)
         .map_err(|error| error.to_string())?;
-    apply_cue_preferences(&mut next, cue)?;
+    let mut restored_cue = cue;
+    apply_automatic_cue(&mut next, crossfader, &mut restored_cue)?;
     Ok(next)
+}
+
+fn automatic_cue_selection(crossfader: f32) -> (bool, bool) {
+    if crossfader < -0.05 {
+        (false, true)
+    } else if crossfader > 0.05 {
+        (true, false)
+    } else {
+        (false, false)
+    }
+}
+
+fn apply_automatic_cue(
+    engine: &mut MixerEngine,
+    crossfader: f32,
+    cue: &mut CuePreferences,
+) -> Result<(), String> {
+    let (cue_a, cue_b) = automatic_cue_selection(crossfader);
+    cue.cue_a = cue_a;
+    cue.cue_b = cue_b;
+    apply_cue_preferences(engine, *cue)
 }
 
 fn apply_cue_preferences(engine: &mut MixerEngine, cue: CuePreferences) -> Result<(), String> {
@@ -1110,11 +1480,16 @@ fn restore_deck(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn unloaded_service_reports_both_decks_paused() {
-        let service = MixerService::start(None, CuePreferences::default()).unwrap();
+        let service = MixerService::start(
+            None,
+            CuePreferences::default(),
+            RoutingPreferences::default(),
+        )
+        .unwrap();
         let snapshot = service.snapshot().unwrap();
         assert_eq!(snapshot.deck_a.loaded_track_id, None);
         assert_eq!(snapshot.deck_b.loaded_track_id, None);
@@ -1122,12 +1497,148 @@ mod tests {
             service.play(DeckId::A).unwrap_err(),
             "no track is loaded in either deck"
         );
+        service
+            .select_cue_output_device("cue-device".to_string())
+            .unwrap();
+        let routed = service
+            .set_routing_mode(RoutingMode::DualDeviceCue)
+            .unwrap();
+        assert_eq!(routed.routing_mode, "dual-device-cue");
+        assert_eq!(routed.cue_output_device_id.as_deref(), Some("cue-device"));
+        assert_eq!(service.set_cue_delay(300).unwrap().cue_delay_ms, 250);
+    }
+
+    #[test]
+    fn crossfader_automatically_cues_the_deck_outside_the_master() {
+        assert_eq!(automatic_cue_selection(-1.0), (false, true));
+        assert_eq!(automatic_cue_selection(-0.06), (false, true));
+        assert_eq!(automatic_cue_selection(0.0), (false, false));
+        assert_eq!(automatic_cue_selection(0.05), (false, false));
+        assert_eq!(automatic_cue_selection(0.06), (true, false));
+        assert_eq!(automatic_cue_selection(1.0), (true, false));
+    }
+
+    #[test]
+    #[ignore = "requires MacBook Pro Speakers and External Headphones with direct CoreAudio access"]
+    fn dual_device_cue_runs_loaded_two_deck_audio() {
+        let run_seconds = std::env::var("DJAPP_DUAL_CUE_RUN_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(3);
+        let devices = djapp_audio_spike::device::output_devices().unwrap();
+        let master = devices
+            .iter()
+            .find(|device| device.name == "MacBook Pro Speakers")
+            .expect("MacBook Pro Speakers must be available");
+        let cue_output = devices
+            .iter()
+            .find(|device| device.name == "External Headphones")
+            .expect("External Headphones must be connected");
+        let cue_preferences = CuePreferences {
+            cue_a: false,
+            cue_b: false,
+            blend: -1.0,
+            gain: 0.1,
+        };
+        let routing = RoutingPreferences {
+            mode: RoutingMode::DualDeviceCue,
+            cue_output_device_id: Some(cue_output.id.clone()),
+            cue_delay_ms: 0,
+        };
+        let service = MixerService::start(Some(master.id.clone()), cue_preferences, routing).unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("tests/fixtures/audio");
+        service
+            .load(DeckId::A, 1, "48 kHz".to_string(), fixtures.join("tone-48k.wav"))
+            .unwrap();
+        service
+            .load(DeckId::B, 2, "96 kHz".to_string(), fixtures.join("tone-96k.wav"))
+            .unwrap();
+        service.set_channel_gain(DeckId::A, 0.05).unwrap();
+        service.set_channel_gain(DeckId::B, 0.05).unwrap();
+        service.set_crossfader(-1.0).unwrap();
+        service.play(DeckId::A).unwrap();
+        service.play(DeckId::B).unwrap();
+        let started = Instant::now();
+        let mut next_seek = Duration::from_millis(1_500);
+        let mut next_report = Duration::from_secs(60);
+        let mut baseline_relative_frames = None;
+        let mut max_relative_deviation = 0_u64;
+        let mut max_signal_peak = 0.0_f32;
+        while started.elapsed() < Duration::from_secs(run_seconds) {
+            thread::sleep(Duration::from_millis(500));
+            let elapsed = started.elapsed();
+            if elapsed >= next_seek {
+                service.seek(DeckId::A, 0.0, true).unwrap();
+                service.seek(DeckId::B, 0.0, true).unwrap();
+                next_seek += Duration::from_millis(1_500);
+            }
+            let current = service.snapshot().unwrap();
+            max_signal_peak = max_signal_peak.max(current.cue_signal_peak);
+            let relative = current
+                .rendered_frames
+                .abs_diff(current.cue_rendered_frames);
+            let baseline = *baseline_relative_frames.get_or_insert(relative);
+            max_relative_deviation = max_relative_deviation.max(relative.abs_diff(baseline));
+            assert_eq!(current.routing_mode, "dual-device-cue");
+            assert_eq!(current.stream_errors, 0);
+            assert_eq!(current.cue_stream_errors, 0);
+            assert_eq!(current.cue_underflow_callbacks, 0);
+            assert_eq!(current.cue_overflow_callbacks, 0);
+            if elapsed >= next_report {
+                println!(
+                    "elapsed_seconds={} master_frames={} cue_frames={} relative_frames={} cue_depth={} cue_min={} cue_max={}",
+                    elapsed.as_secs(),
+                    current.rendered_frames,
+                    current.cue_rendered_frames,
+                    relative,
+                    current.cue_queue_depth_frames,
+                    current.cue_min_queue_depth_frames,
+                    current.cue_max_queue_depth_frames,
+                );
+                next_report += Duration::from_secs(60);
+            }
+        }
+        let snapshot = service.snapshot().unwrap();
+        println!(
+            "run_seconds={} master_callbacks={} master_frames={} master_errors={} cue_callbacks={} cue_frames={} relative_frames={} max_relative_deviation={} cue_depth={} cue_min={} cue_max={} cue_underflows={} cue_overflows={} cue_errors={} cue_signal_peak={}",
+            run_seconds,
+            snapshot.callbacks,
+            snapshot.rendered_frames,
+            snapshot.stream_errors,
+            snapshot.cue_callbacks,
+            snapshot.cue_rendered_frames,
+            snapshot.rendered_frames.abs_diff(snapshot.cue_rendered_frames),
+            max_relative_deviation,
+            snapshot.cue_queue_depth_frames,
+            snapshot.cue_min_queue_depth_frames,
+            snapshot.cue_max_queue_depth_frames,
+            snapshot.cue_underflow_callbacks,
+            snapshot.cue_overflow_callbacks,
+            snapshot.cue_stream_errors,
+            max_signal_peak,
+        );
+        assert_eq!(snapshot.routing_mode, "dual-device-cue");
+        assert!(snapshot.callbacks > 0);
+        assert!(snapshot.cue_callbacks > 0);
+        assert_eq!(snapshot.stream_errors, 0);
+        assert_eq!(snapshot.cue_stream_errors, 0);
+        assert_eq!(snapshot.cue_underflow_callbacks, 0);
+        assert_eq!(snapshot.cue_overflow_callbacks, 0);
+        assert!(snapshot.cue_queue_depth_frames < 4_096);
+        assert!(max_signal_peak > 0.0001, "cue callback consumed only silence");
     }
 
     #[test]
     #[ignore = "requires direct CoreAudio device access"]
     fn mixed_rate_two_deck_commands_share_one_healthy_stream() {
-        let service = MixerService::start(None, CuePreferences::default()).unwrap();
+        let service = MixerService::start(
+            None,
+            CuePreferences::default(),
+            RoutingPreferences::default(),
+        )
+        .unwrap();
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("tests/fixtures/audio");
