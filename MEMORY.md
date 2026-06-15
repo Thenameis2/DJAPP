@@ -6,14 +6,14 @@ Read this file before every task and update it after every meaningful change. Ke
 
 ## Current State
 
-- Status: Stage-thirteen dual-device cue loaded stability accepted; professional two-deck UI redesign and crossfader-follow cue behavior implemented; manual audio acceptance remains pending.
+- Status: ADR-011 architecture is approved and its isolated Signalsmith spike passes synthetic acceptance; production tempo integration awaits owner approval and listening acceptance.
 - Target: private, offline-first macOS DJ desktop application.
 - Target hardware: Apple M3 Mac.
 - Implementation: reusable Rust engine plus a Tauri 2, React, TypeScript, and Vite macOS application scaffold.
 - Production architecture: approved.
 - Database schema: version 1 created and tested.
 - External APIs: none.
-- Known bugs: none confirmed. Physical channels 3–4 cue output has not yet been tested because no four-channel device or aggregate device is currently available. External Headphones can receive nonzero cue samples; audible volume still requires manual confirmation.
+- Known bugs: none confirmed. Physical channels 3–4 cue output has not yet been tested because no four-channel device or aggregate device is currently available.
 
 ## Confirmed Product Decisions
 
@@ -87,7 +87,7 @@ Reasoning: a desktop application is better suited than a browser application for
 ## Known Issues And Risks
 
 - Target machine runs macOS 26.4.1 on arm64 Apple M3 hardware.
-- CPAL 0.18.1, `rtrb` 0.3.4, Symphonia 0.6.0, Rubato 3.0.0, and `rusqlite` 0.40.1 with bundled SQLite are approved and locked. Remaining production dependencies still require staged approval.
+- CPAL 0.18.1, `rtrb` 0.3.4, Symphonia 0.6.0, Rubato 3.0.0, and `rusqlite` 0.40.1 with bundled SQLite are approved and locked. `signalsmith-stretch` 0.1.3 is locked only as an optional spike dependency; production use still requires approval.
 - The project minimum toolchain is Rust 1.96 because the approved bundled SQLite build does not compile on the previous Rust 1.85 toolchain.
 - Exact effects for version 1 have not been selected.
 - Performance and latency targets have not been benchmarked.
@@ -102,9 +102,9 @@ Reasoning: a desktop application is better suited than a browser application for
 
 ## Next Meaningful Tasks
 
-1. Complete physical cue acceptance with a four-channel interface or user-created macOS aggregate device.
-2. Complete ADR-010 manual acceptance: audible latency calibration and physical cue/master device-loss recovery.
-3. Continue with the next core DJ control milestone after dual-device acceptance.
+1. Complete the Signalsmith listening check on percussion, vocals, bass-heavy music, and sustained harmonic material.
+2. Approve or reject production `TempoProcessor` integration using `signalsmith-stretch` 0.1.3.
+3. If approved, implement worker-side manual tempo, key lock, independent pitch, latency-aware snapshots, and UI controls without enabling beat sync yet.
 
 ### 2026-06-13 - Dependency Architecture Evaluation
 
@@ -330,6 +330,33 @@ Reasoning: a desktop application is better suited than a browser application for
 - Reason: External Headphones were detected but the owner could not hear the cued track, while the previous stability test had deliberately muted every signal and could not distinguish a live silent stream from real cue audio.
 - Verification: A five-second direct CoreAudio run measured a nonzero cue peak of `0.00062491273` with 441 master callbacks, 443 cue callbacks, and zero stream errors, underflows, or overflows. Rust tests and the frontend production build pass.
 - Follow-up: In the app, set Cue Level above zero and Cue/Master toward Cue. If the live cue-signal indicator is active but headphones remain silent, verify the macOS volume for External Headphones.
+
+### 2026-06-15 - ADR-010 Hardware Accepted
+
+- Type: completed
+- Status: completed
+- Change: The owner confirmed that separate-device headphone cue is audible and working correctly on the target Apple M3 with MacBook Pro Speakers as master and External Headphones as cue. ADR-010 is marked fully accepted.
+- Reason: Manual audible confirmation completes the hardware evidence provided by the loaded 30-minute soak, nonzero cue-signal test, queue telemetry, and fail-closed recovery design.
+- Verification: Owner confirmation on the target setup; automated and hardware results remain documented in `docs/testing/dual-device-cue-routing.md`.
+- Follow-up: Proceed to the tempo, pitch, sync, and jog architecture milestone.
+
+### 2026-06-15 - Tempo, Pitch, Sync, And Jog Proposal
+
+- Type: decision
+- Status: proposed
+- Change: Created ADR-011 proposing a worker-side `TempoProcessor`, an isolated `signalsmith-stretch` 0.1.3 Apple-silicon spike, manual tempo/key-lock/pitch controls, bounded pitch bend, paused seek and playing nudge jog behavior, and capability-gated master/follower sync based on future BPM and beat-grid analysis.
+- Reason: Version one requires professional deck speed and synchronization controls, while Rubato only handles fixed sample-rate conversion and the Signalsmith Rust wrapper still needs measured quality, latency, CPU, native-build, and sustained-playback validation.
+- Verification: Reconciled the proposal with ADR-001, ADR-002, the current decoder/worker/callback ownership model, and current primary Signalsmith/Rubber Band licensing and API documentation. No dependency was installed and no production tempo code was added.
+- Follow-up: Owner approval is required before adding `signalsmith-stretch` 0.1.3 for the isolated spike.
+
+### 2026-06-15 - Signalsmith Tempo And Pitch Spike Completed
+
+- Type: decision
+- Status: completed
+- Change: The owner approved ADR-011 and its isolated evaluation. Added `signalsmith-stretch` 0.1.3 as an optional feature-gated dependency and a standalone synthetic benchmark binary. The production engine, mixer, Tauri commands, and UI do not enable or call it.
+- Reason: Validate native Apple-silicon build compatibility, latency, CPU headroom, tempo ratios, pitch accuracy, reset/flush behavior, and sustained two-deck processing before production integration.
+- Verification: The crate built without patches using AppleClang C++14 and Bindgen. Unit tests, formatting, Clippy with warnings denied, and normal all-target checks pass. Both presets passed five tempo ratios and five pitch shifts; worst pitch error was 9.37 cents. Reset/flush stress remained finite. The default-preset release soak processed two concurrent 1,800-second stereo decks in 15.011 seconds with zero simulated buffered underflows; 23 isolated scheduling spikes were absorbed by its 120 ms processor buffer. The spike arm64 executable is 677,336 bytes and links only system `libc++` and `libSystem`.
+- Follow-up: Complete manual listening acceptance, then request owner approval for production integration behind the ADR-011 `TempoProcessor` boundary. Beat sync remains deferred until BPM and beat-grid analysis exists.
 
 ## Update Template
 

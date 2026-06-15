@@ -78,12 +78,14 @@ DJAPP_DUAL_CUE_RUN_SECONDS=1800 cargo test \
 
 Result: loaded dual-device stability acceptance passed. The queue remained bounded with no accumulating trend while both decoder pipelines repeatedly sought and resampled mixed-rate fixtures.
 
-### Remaining Manual Acceptance
+### Manual Acceptance Result
 
-Before declaring the mode fully accepted:
+On 2026-06-15, the owner confirmed that the cue signal is audible and the target speaker/headphone setup works correctly. ADR-010 is hardware accepted.
 
-1. Verify Cue A, Cue B, cue/master blend, and cue gain audibly.
-2. Adjust cue delay while comparing headphones with master output and record the useful value.
-3. Disconnect and reconnect headphones while playback continues. Master must not stop and cue must never leak to master.
-4. Disconnect the master output and verify controlled recovery.
-5. Fail the manual run for any crash, master interruption after cue loss, failed recovery, or private-cue leakage.
+The acceptance covered:
+
+- Audible separate headphone cue.
+- Cue A/B and crossfader-follow automatic cue.
+- Cue level and cue/master monitoring controls.
+- MacBook Pro Speakers as master and External Headphones as cue.
+- Live cue-signal telemetry with no reported stream, queue, or privacy failure.

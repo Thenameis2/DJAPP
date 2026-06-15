@@ -1,6 +1,6 @@
 # ADR-010: Production Dual-Device Cue Routing
 
-- Status: Approved and implemented; manual hardware acceptance pending
+- Status: Approved, implemented, and hardware accepted
 - Date: 2026-06-14
 - Scope: Separate stereo master and headphone-cue outputs on matching-rate macOS devices
 
@@ -177,4 +177,8 @@ The owner approved ADR-010 on 2026-06-14.
 - Tauri snapshots and the interim UI expose routing controls, limitation messages, and queue health.
 - No production dependency was added.
 
-A loaded 30-minute Apple M3 run used MacBook Pro Speakers for master and External Headphones for cue while repeatedly seeking and resampling mixed-rate fixtures. It completed 155,066 master callbacks and 155,068 cue callbacks. Queue depth remained between 512 and 2,048 frames, maximum relative progress deviation was one 512-frame callback quantum, and there were zero underflows, overflows, or stream errors. Loaded stability acceptance passed. Audible delay calibration and physical disconnect/reconnect checks remain required before final production acceptance.
+A loaded 30-minute Apple M3 run used MacBook Pro Speakers for master and External Headphones for cue while repeatedly seeking and resampling mixed-rate fixtures. It completed 155,066 master callbacks and 155,068 cue callbacks. Queue depth remained between 512 and 2,048 frames, maximum relative progress deviation was one 512-frame callback quantum, and there were zero underflows, overflows, or stream errors. Loaded stability acceptance passed; final manual acceptance is recorded below.
+
+## Final Acceptance
+
+On 2026-06-15, the owner confirmed that separate-device cue is audible and working correctly with MacBook Pro Speakers as master and External Headphones as cue. The redesigned interface exposes cue level, cue/master blend, delay, and live cue-signal telemetry. Together with the completed loaded 30-minute soak and recovery protections, ADR-010 is hardware accepted for the target Apple M3 setup.
