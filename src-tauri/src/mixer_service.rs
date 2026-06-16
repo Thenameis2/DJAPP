@@ -1632,7 +1632,15 @@ fn restore_deck(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use djapp_audio_spike::{
+        analysis::{
+            pipeline::WaveformLoudnessProcessor,
+            service::AnalysisService,
+            types::{AnalysisStage, TrackIdentity},
+        },
+        persistence::{NewTrack, PersistenceWorker},
+    };
+    use std::{fs, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
     #[test]
     fn unloaded_service_reports_both_decks_paused() {
@@ -1897,5 +1905,115 @@ mod tests {
         assert_eq!(stopped.deck_b.recycle_failures, 0);
         assert_eq!(stopped.deck_a.worker_error, None);
         assert_eq!(stopped.deck_b.worker_error, None);
+    }
+
+    #[test]
+    #[ignore = "requires direct CoreAudio device access on the Apple M3 target"]
+    fn two_deck_playback_remains_healthy_during_full_track_analysis() {
+        let service = MixerService::start(
+            None,
+            CuePreferences::default(),
+            RoutingPreferences::default(),
+        )
+        .unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("tests/fixtures/audio");
+        service
+            .load(DeckId::A, 1, "48 kHz".to_string(), fixtures.join("tone-48k.wav"))
+            .unwrap();
+        service
+            .load(DeckId::B, 2, "96 kHz".to_string(), fixtures.join("tone-96k.wav"))
+            .unwrap();
+        service.set_channel_gain(DeckId::A, 0.0).unwrap();
+        service.set_channel_gain(DeckId::B, 0.0).unwrap();
+        service.play(DeckId::A).unwrap();
+        service.play(DeckId::B).unwrap();
+        thread::sleep(Duration::from_millis(500));
+        let before = service.snapshot().unwrap();
+
+        let root = std::env::temp_dir().join(format!(
+            "djapp-analysis-playback-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("music.wav");
+        fs::copy(fixtures.join("music-like-48k.wav"), &source).unwrap();
+        let metadata = fs::metadata(&source).unwrap();
+        let modified_at_ms = metadata
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let persistence = Arc::new(PersistenceWorker::start(root.join("library.sqlite")).unwrap());
+        let track_id = persistence
+            .upsert_track(NewTrack {
+                library_root_id: None,
+                path: source.to_string_lossy().into_owned(),
+                file_size: metadata.len() as i64,
+                modified_at_ms,
+                content_fingerprint: None,
+                title: Some("Analysis load".to_string()),
+                artist: None,
+                album: None,
+                genre: None,
+                duration_frames: None,
+                sample_rate: Some(48_000),
+                channels: Some(2),
+                codec: Some("pcm_s16le".to_string()),
+                missing: false,
+                updated_at_ms: modified_at_ms,
+            })
+            .unwrap()
+            .id;
+        let analysis = AnalysisService::start(
+            Arc::clone(&persistence),
+            WaveformLoudnessProcessor::new(root.join("cache")),
+        )
+        .unwrap();
+        analysis
+            .enqueue(TrackIdentity {
+                track_id,
+                path: source,
+                file_size: metadata.len(),
+                modified_at_ms,
+                content_fingerprint: None,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if analysis.snapshots().unwrap().iter().any(|snapshot| {
+                snapshot.track_id == track_id && snapshot.stage == AnalysisStage::Complete
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "analysis did not finish during playback");
+            thread::sleep(Duration::from_millis(50));
+        }
+        let after = service.snapshot().unwrap();
+        println!(
+            "analysis_playback callbacks_before={} callbacks_after={} stream_errors={} deck_a_underflows={} deck_b_underflows={} deck_a_recycle={} deck_b_recycle={}",
+            before.callbacks,
+            after.callbacks,
+            after.stream_errors,
+            after.deck_a.underflow_callbacks,
+            after.deck_b.underflow_callbacks,
+            after.deck_a.recycle_failures,
+            after.deck_b.recycle_failures,
+        );
+        assert!(after.callbacks > before.callbacks);
+        assert_eq!(after.stream_errors, before.stream_errors);
+        assert_eq!(after.deck_a.underflow_callbacks, before.deck_a.underflow_callbacks);
+        assert_eq!(after.deck_b.underflow_callbacks, before.deck_b.underflow_callbacks);
+        assert_eq!(after.deck_a.recycle_failures, before.deck_a.recycle_failures);
+        assert_eq!(after.deck_b.recycle_failures, before.deck_b.recycle_failures);
+        assert_eq!(after.deck_a.worker_error, None);
+        assert_eq!(after.deck_b.worker_error, None);
+        assert_eq!(persistence.analysis(track_id).unwrap().unwrap().status, "complete");
+        analysis.shutdown().unwrap();
+        drop(persistence);
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -3,3 +3,6 @@
 /dist/
 /src-tauri/target/
 .DS_Store
+/private-benchmarks/
+*.local.tsv
+*.local.csv

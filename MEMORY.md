@@ -6,14 +6,15 @@ Read this file before every task and update it after every meaningful change. Ke
 
 ## Current State
 
-- Status: Reliable streaming vinyl-style rate adjustment is implemented without Signalsmith. The engine-rate recycled-buffer repetition defect is fixed and confirmed by the owner. Key lock and independent pitch remain fail-closed; BPM/beat-grid analysis is not implemented.
+- Status: Reliable streaming vinyl-style rate adjustment is implemented without Signalsmith. ADR-012 stages one through nine are implemented. Analysis is accepted for library metadata, cache reuse, queue visibility, manual corrections, and diagnostics. Analysis data is not consumed by Sync or AutoMix because generated BPM accuracy remains below the owner benchmark gate.
 - Target: private, offline-first macOS DJ desktop application.
 - Target hardware: Apple M3 Mac.
 - Implementation: reusable Rust engine plus a Tauri 2, React, TypeScript, and Vite macOS application scaffold.
 - Production architecture: approved.
 - Database schema: version 1 created and tested.
 - External APIs: none.
-- Known bugs: Physical channels 3–4 cue output has not yet been tested because no four-channel device or aggregate device is currently available. BPM, beat-grid, key, waveform, and loudness analysis are not implemented.
+- Known bugs: Physical channels 3–4 cue output has not yet been tested because no four-channel device or aggregate device is currently available. Analysis is exposed in the library UI but Sync and AutoMix do not consume it. Target-hardware playback-under-analysis passes, but key/rhythm accuracy, confidence calibration, and full-library behavior still require a labeled representative music corpus.
+- Current analysis issue: owner reports generated BPM is inaccurate compared with other DJ software on real music. Queue visibility has been improved, and the first five-track private benchmark now accepts 4/5 exact BPMs after precision refinement, but BPM quality remains unresolved because the ADR gate requires at least 90% acceptance on a larger representative set.
 
 ## Confirmed Product Decisions
 
@@ -99,12 +100,31 @@ Reasoning: a desktop application is better suited than a browser application for
 - The theme toggle is session-only until a settings command is connected to SQLite.
 - Scans skip symlinks. If traversal errors occur, missing-file reconciliation is skipped for that scan to prevent false missing records.
 - One dedicated mixer-service thread owns both decks and the single CoreAudio stream; Tauri commands never hold or share the stream directly. UI snapshots poll at 2 Hz.
+- Generated BPM is not yet trusted for Sync or AutoMix because owner comparison against other DJ software found inaccurate values. The next analysis-quality pass needs representative local tracks, expected BPM labels, and half-time/double-time review.
 
 ## Next Meaningful Tasks
 
 1. Complete the Signalsmith listening check on percussion, vocals, bass-heavy music, and sustained harmonic material.
 2. Design and approve momentary pitch-bend and playing/paused jog behavior on top of the production tempo worker.
-3. Implement BPM and beat-grid analysis before enabling master/follower Sync.
+3. Populate the private BPM accuracy benchmark manifest with owner-selected tracks and expected BPM values, then tune the rhythm estimator before enabling Sync or analysis-driven AutoMix.
+
+### 2026-06-15 - Analysis Queue UX And BPM Accuracy Follow-Up
+
+- Type: bug
+- Status: partially mitigated
+- Change: Added queue-position reporting to analysis job snapshots, changed `analysis_analyze_all()` to return a structured enqueue summary, and added a React Analyze Queue popup that auto-opens while analysis work is active. The popup shows order, current stage, progress, generated BPM/confidence, and per-track cancellation.
+- Reason: The owner reported that long analysis queues felt slow and unresponsive, and that generated BPM values are inaccurate compared with other DJ software.
+- Verification: Engine tests, Tauri tests, strict Clippy runs, frontend production build, formatting, and diff checks passed during the queue UI update.
+- Follow-up: Collect a small representative set of failing tracks with expected BPM values from the comparison software, then tune the BPM estimator and confidence thresholds before enabling Sync or analysis-driven AutoMix.
+
+### 2026-06-15 - Rhythm Analyzer Boundary Panic Fixed
+
+- Type: bug
+- Status: completed
+- Change: Fixed an out-of-range slice panic in `sample_envelope()` when beat-grid fitting requests strength just past the last onset-envelope bucket.
+- Reason: The owner hit a `djapp-analysis` panic at `src/analysis/rhythm.rs:301` while analyzing real music. A fitted beat near the source tail could produce an envelope position beyond the slice length.
+- Verification: Added a regression test for out-of-range envelope sampling. `cargo test --offline analysis::rhythm`, `cargo test --offline --all-targets`, `cargo clippy --offline --all-targets -- -D warnings`, and `cargo fmt --all --check` pass.
+- Follow-up: Continue BPM accuracy work separately with labeled real tracks; this fix prevents the panic but does not claim to improve BPM correctness.
 
 ### 2026-06-13 - Dependency Architecture Evaluation
 
@@ -473,16 +493,106 @@ Reasoning: a desktop application is better suited than a browser application for
 - Change: `EngineRateDecoder` now clears a recycled PCM buffer before copying the next resampler output into it. The full-track tempo diagnostic is capped at the 20-second rate-transition window, and a regression compares fresh-buffer decoding with production-style buffer reuse.
 - Reason: For tracks whose native sample rate differs from the 48 kHz engine rate, the resampler appended each new converted block after samples retained from the previous block. This replayed earlier audio and made rate changes appear to loop on MP3 and affected WAV files; the defect was in sample-rate conversion, not BPM analysis or varispeed interpolation.
 - Verification: The affected private 44.1 kHz MP3 reproduced an exact repeated window before the fix and reports `repeat_detected=false` afterward. Its 20-second diagnostic decoded-frame count fell from 1,845,280 accumulated frames to the expected 974,880. The reusable-buffer regression produces sample-for-sample output equal to fresh-buffer decoding.
-- Follow-up: Restart `npm run tauri dev` so the native engine rebuilds, then repeat the same MP3 and WAV listening test.
+- Follow-up: None; the owner confirmed the application works after rebuilding.
 
-### 2026-06-15 - Track Analysis Pipeline Proposed
+### 2026-06-15 - Track Analysis Pipeline Approved
 
 - Type: decision
-- Status: proposed
+- Status: approved; stages one through three completed
 - Change: Created `docs/architecture/ADR-012-track-analysis-pipeline.md`. It proposes a single bounded background worker, project-owned waveform/BPM/beat-grid/downbeat/key algorithms, versioned atomic cache files, confidence-based feature gating, and the existing SQLite schema. The only proposed new dependencies are `rustfft` and `ebur128`.
 - Reason: Trustworthy cached analysis is required before BPM display, real waveforms, Sync, gain normalization, and analysis-driven AutoMix can be enabled without risking audio reliability or misleading the DJ.
-- Verification: The proposal was checked against ADR-001, ADR-003, ADR-011, the current persistence schema, requirements, and audio-thread rules. No dependency, schema, implementation, or UI layout change was made.
-- Follow-up: Obtain owner approval for ADR-012 before adding dependencies or implementing the pipeline.
+- Verification: The owner approved ADR-012. Added pinned `rustfft` 6.4.1 and `ebur128` 0.1.10 dependencies, project-owned analysis/result types, versioned waveform and beat-grid cache codecs, and deterministic click/key fixtures. Fifty-one engine tests, six CLI tests, two Tauri tests, engine/Tauri Clippy with warnings denied, and the frontend production build pass. Cache tests cover round trips, truncation, version mismatch, invalid confidence, and non-monotonic beats.
+- Follow-up: Completed by `Track Analysis Stage Two Completed` below.
+
+### 2026-06-15 - Track Analysis Stage Two Completed
+
+- Type: completed
+- Status: completed
+- Change: Added a bounded single-worker `AnalysisService`, injectable processor boundary, exact-identity deduplication, changed-identity replacement, cooperative cancellation, retained snapshots, queue limits, joined shutdown, result validation, and `pending`/`running`/`complete`/`failed` persistence transitions through the existing SQLite worker. Added analysis-record lookup without changing schema version 1.
+- Reason: The waveform, loudness, rhythm, and key algorithms need a controlled non-real-time execution boundary that cannot block audio callbacks or create competing database ownership.
+- Verification: Fifty-six engine tests, six CLI tests, two default Tauri tests, engine and Tauri Clippy with warnings denied, and the frontend production build pass. Service tests cover persisted running/completion, duplicate rejection, changed-file replacement, active cancellation, bounded queue rejection, queued cancellation, and clean shutdown.
+- Follow-up: Stage three is completed below. Runtime `cancelled` still persists as `failed` with `analysis cancelled` because schema version 1 has no cancelled status; changing that requires migration approval.
+
+### 2026-06-15 - Track Analysis Stage Three Completed
+
+- Type: completed
+- Status: completed
+- Change: Added single-pass `WaveformLoudnessProcessor` analysis using the existing decoder and `ebur128`; a project-owned per-channel min/max/RMS waveform pyramid; source identity checks before and after decoding; deterministic cache naming; atomic temporary-file writes; and persistence of integrated LUFS, true peak dBTP, and waveform paths. Waveform format version 1 now uses little-endian `f32` triples and 256-frame base buckets with four-to-one coarser levels.
+- Reason: Real waveform data and standards-based gain-normalization measurements are the first useful cached analysis products and establish the decode/cache path required by later BPM, beat-grid, and key stages.
+- Verification: Sixty-four engine tests, six CLI tests, two default Tauri tests, engine/Tauri Clippy with warnings denied, and the frontend production build pass. Tests cover weighted RMS/extrema, stereo ordering, malformed PCM, cancellation, stale identity, atomic cache publication, all supported fixture formats, and end-to-end SQLite persistence.
+- Follow-up: Stage four is completed below. Tauri lifecycle and React waveform display remain deferred to the approved UI/API integration stage.
+
+### 2026-06-15 - Track Analysis Stage Four Completed
+
+- Type: completed
+- Status: completed
+- Change: Added chunk-independent mono conversion to 22,050 Hz, streaming Hann-window RustFFT spectral-flux extraction, adaptive onset normalization, strict 60-200 BPM autocorrelation candidates, harmonic half/double-tempo scoring, sub-hop and long-span precision refinement, confidence output, BPM persistence, and the `bpm_benchmark` diagnostic.
+- Reason: Reliable BPM metadata is required before beat-grid tracking and later Sync, but it must reject silence and stationary tones, expose uncertainty, and remain outside the audio callback.
+- Verification: The deterministic 60/90/120/128/150/180 BPM benchmark has a worst error of 0.009645%. The music-like fixture measures 119.811985 BPM; accented and syncopated fixtures resolve to 120 BPM; silence and steady tones return no BPM. Seventy-three engine tests, six CLI tests, two default Tauri tests, both Clippy runs with warnings denied, and the frontend build pass.
+- Follow-up: Stage five is completed below. Do not enable Sync until the later corpus and playback-under-analysis acceptance milestone.
+
+### 2026-06-15 - Track Analysis Stage Five Completed
+
+- Type: completed
+- Status: completed
+- Change: Added dynamic-programming onset tracking, weighted beat-grid fitting, grid confidence, conservative four-beat downbeat inference, rational source-frame conversion, atomic versioned beat-grid caches, SQLite path persistence, and the `beat_grid_benchmark` diagnostic.
+- Reason: Beat positions on the original track timeline are required before Sync or beat-aware transitions can be evaluated, while uncertain meter evidence must not create false downbeats.
+- Verification: Deterministic 60-180 BPM, accented, and syncopated fixtures have median absolute timing errors from 9.524 ms to 11.882 ms, below the approved 20 ms target. Only the accented fixture receives downbeats. All 76 engine tests, eight CLI tests, two default Tauri tests, both strict Clippy runs, and the frontend production build pass; two hardware-only CoreAudio tests remain ignored.
+- Follow-up: Stage six is completed below. Sync remains disabled pending labeled-corpus and playback-under-analysis acceptance.
+
+### 2026-06-15 - Track Analysis Stage Six Completed
+
+- Type: completed
+- Status: completed
+- Change: Added streaming chroma and tuning analysis, major/minor template scoring, confidence and rejection gates, canonical key persistence, validated correction writes, an effective-analysis read model with manual BPM/key/grid-offset precedence, and the `key_benchmark` diagnostic.
+- Reason: Key metadata and correction precedence are required before analysis can be exposed reliably to the library UI or used as a compatibility signal without re-analysis overwriting user choices.
+- Verification: All 24 synthetic major/minor keys classify exactly; A minor remains correct from -35 through +35 cents; silence, broadband noise, and pitched percussion return no key. Correction tests prove overrides remove generated confidence from the effective value while preserving the original generated record. All 81 engine tests, eight CLI tests, two default Tauri tests, both strict Clippy runs, the key benchmark, frontend production build, and diff checks pass; two hardware-only CoreAudio tests remain ignored.
+- Follow-up: Stage seven is completed below. Sync remains disabled.
+
+### 2026-06-15 - Track Analysis Stage Seven Completed
+
+- Type: completed
+- Status: completed
+- Change: Started the bounded analysis worker in Tauri, added analyze/cancel/job/correction/artifact commands, identity-based stale detection, intermediate progress reporting, enriched library results, and existing-layout Analyze/Cancel/Correct UI controls with confidence indicators.
+- Reason: Generated analysis must be observable, cancellable, safely cache-validated, and correction-aware in the desktop application before playback stress tests or Sync acceptance can be meaningful.
+- Verification: All 81 engine tests, eight CLI tests, three default Tauri tests, both strict Clippy runs, the frontend production build, and diff checks pass; two hardware-only CoreAudio tests remain ignored. Tauri coverage includes current-versus-changed source identity, while engine coverage includes progress, cancellation, caches, algorithms, and correction precedence.
+- Follow-up: Stage eight is completed below. Do not enable Sync yet.
+
+### 2026-06-15 - Track Analysis Stage Eight Completed
+
+- Type: completed
+- Status: completed with benchmark limitation
+- Change: Added cache-reopen-without-source coverage, active production cancellation checks, and a muted Apple M3 CoreAudio harness that runs complete analysis while two mixed-rate decks play. Re-ran deterministic BPM, beat-grid, key, supported-format, and application verification.
+- Reason: Analysis must demonstrate cache durability, cancellation safety, and no playback-health regression on target hardware before its metadata can be considered for live feature gating.
+- Verification: Apple M3 callbacks advanced from 43 to 219 during full analysis with zero stream errors, deck underflows, recycle failures, or worker errors. BPM worst error remains 0.009645%, beat-grid median error remains 9.524-11.882 ms, and all 24 synthetic keys classify exactly. Cache reopen succeeds after source removal and active cancellation publishes no cache paths. All 83 engine tests, eight CLI tests, three default Tauri tests, both strict Clippy runs, the frontend production build, benchmarks, hardware acceptance run, and diff checks pass; three direct-CoreAudio tests remain ignored by default.
+- Follow-up: Completed by Track Analysis Stage Nine.
+
+### 2026-06-15 - Track Analysis Stage Nine Completed
+
+- Type: decision
+- Status: completed
+- Change: Completed ADR-012's feature-gating milestone. Analysis remains enabled for library display, cache reuse, manual corrections, queue UX, and diagnostics. Master/follower Sync, beat-aware AutoMix timing, compatibility-based AutoMix reordering, downbeat-dependent transitions, and automatic generated-value correction remain disabled.
+- Reason: Available deterministic and Apple M3 stability evidence is sufficient for metadata display but not sufficient for DJ-grade live features. Owner feedback shows generated BPM is inaccurate on at least some real music compared with other software, and no labeled real-music benchmark or representative full-library soak has been accepted.
+- Verification: Updated ADR-012 and added `docs/testing/analysis-feature-gating.md` to record the accepted evidence, missing evidence, active gates, and next acceptance work.
+- Follow-up: Build a private benchmark manifest with representative tracks and expected BPM values, then tune BPM ambiguity handling and confidence thresholds before reconsidering Sync or analysis-driven AutoMix.
+
+### 2026-06-15 - BPM Accuracy Milestone Started
+
+- Type: tooling
+- Status: in progress
+- Change: Extended `bpm_benchmark` with private TSV manifest and segment-diagnostic modes and documented the workflow in `docs/testing/bpm-accuracy-milestone.md`. Added ignore rules for `private-benchmarks/`, `*.local.tsv`, and `*.local.csv`. After the first owner run showed 0/5 accepted exact-BPM real tracks, added candidate diagnostics, capped BPM confidence for ambiguous top candidates, added 20-second segment-consensus candidates with half/double variants, added beat-support reranking, weighted low/low-mid spectral flux, and added octave correction for near-tied half/double candidates. The next pass removed tempo-range forcing and added neutral candidate grid diagnostics for beat strength, offbeat contrast, stability, section consistency, and octave ambiguity. Later passes added dependency-free low, low-mid, mid, and high rhythm envelopes with cross-band candidate generation, `bands` diagnostics, temporal tempo-state scoring over overlapping 12-second windows with `state` diagnostics, scratch-built comb-filter/tempogram-style `comb` diagnostics, dynamic-programming beat-sequence `seq` diagnostics, explicit tempo-octave resolver `oct` diagnostics, and bounded precision-refinement `fit` diagnostics. Bumped `ANALYSIS_VERSION` from 1 to 11 so stale overconfident, pre-consensus, pre-reranking, pre-grid-diagnostic, pre-multi-band, pre-tempo-state, pre-comb-filter, pre-beat-sequence, pre-octave-resolver, and pre-precision-refinement results are invalidated.
+- Reason: Real-song BPM accuracy cannot be tuned from synthetic fixtures alone. The owner needs repeatable comparison against reference BPM values from other DJ software without committing private music or paths. Candidate diagnostics distinguish bad ranking from missing onset evidence, and confidence calibration must not mark wrong real-song estimates as trustworthy.
+- Verification: Private manifest acceptance improved from 0/5 to 4/5 exact BPMs after precision refinement. `ffawty - Stay Home` now passes at 151.298 BPM for expected 151.0, `Lil Tecca - Down With Me` passes at 115.140 BPM for expected 115.0, `U Fancy` passes at 148.194 BPM for expected 148.0, and `LUCKI - MORE THAN EVER` passes at 151.991 BPM for expected 152.0. `Lil Gnar - Welcome 2 Da Game` remains the hardest failure: the correct-neighborhood 75.418 BPM candidate is present and within the 1% gate for expected 76.0, but it ranks behind 94.233 BPM.
+- Follow-up: Re-run Analyze Missing after rebuilding so analysis version 11 refreshes cached BPM and confidence. The next BPM work should target hard wrong-family ranking for `Lil Gnar`-style tracks and expand the private benchmark toward the ADR's 25-track representative set.
+
+### 2026-06-16 - BPM Accuracy Dependency Decision Approved
+
+- Type: decision
+- Status: approved; in-house spike stage five completed
+- Change: Added `docs/architecture/ADR-013-bpm-accuracy-and-rhythm-dependency-decision.md` comparing continued project-owned deep beat tracking, aubio, Essentia, and madmom for BPM/beat accuracy. Owner approval selected the in-house spike first. Stage one added temporal tempo-state scoring without new dependencies, stage two added scratch-built comb-filter/tempogram-style candidate scoring, stage three added dynamic-programming beat-sequence support with `seq` diagnostics, stage four added an explicit tempo-octave resolver with `oct` diagnostics, and stage five added bounded precision refinement with `fit` diagnostics plus a narrow near-tie evidence breaker. The aubio comparison path has a non-production `aubio_compare` diagnostic binary that shells out to an installed `aubiotrack` command and estimates BPM from beat timestamps. Installed aubio `0.4.9` through Homebrew for local diagnostics only.
+- Reason: The private BPM benchmark remains 1/5 after several dependency-free tuning passes, so the project needs an explicit decision before adding copyleft/native rhythm dependencies or continuing deeper in-house algorithm work.
+- Verification: Checked current upstream project documentation for aubio, `aubio-rs`, Essentia, and madmom. Focused rhythm and benchmark tests pass. The private five-track manifest now reaches 4/5 for the project-owned analyzer after `fit`, but generated BPM still must not drive Sync or AutoMix because the ADR gate is 90% on a larger representative set. Default `aubiotrack` accepted 0/5 exact BPMs on the private manifest, so aubio is not a drop-in accuracy fix.
+- Follow-up: aubio remains GPL and is not approved for shipping or Tauri integration. Further aubio work, if any, should stay diagnostic and compare alternate `aubiotrack` onset methods or thresholds. The next project-owned BPM step should target hard wrong-family ranking for `Lil Gnar`-style tracks, while manual BPM correction UX remains the practical safety valve.
 
 ## Update Template
 

@@ -6,9 +6,19 @@ use std::{
 };
 
 use djapp_audio_spike::{
+    analysis::{
+        cache::{BeatGridCache, WaveformCache},
+        pipeline::{identity_digest, WaveformLoudnessProcessor},
+        service::{AnalysisJobSnapshot, AnalysisService, AnalysisServiceError},
+        types::{AnalysisStage, TrackIdentity},
+        ANALYSIS_VERSION,
+    },
     library::{scan_library_root, ScanSummary},
     mixer::DeckId,
-    persistence::{PersistenceWorker, TrackRecord, SCHEMA_VERSION},
+    persistence::{
+        EffectiveAnalysisRecord, PersistenceWorker, TrackCorrectionRecord, TrackRecord,
+        SCHEMA_VERSION,
+    },
 };
 use serde::Serialize;
 use tauri::Manager;
@@ -32,6 +42,7 @@ const CUE_DELAY_SETTING: &str = "audio.cue_delay_ms";
 struct AppState {
     persistence: Arc<PersistenceWorker>,
     mixer: Arc<MixerService>,
+    analysis: Arc<AnalysisService>,
 }
 
 #[derive(Serialize)]
@@ -76,10 +87,20 @@ struct TrackView {
     duration_seconds: Option<f64>,
     codec: Option<String>,
     missing: bool,
+    analysis_status: Option<String>,
+    analysis_error: Option<String>,
+    bpm: Option<f64>,
+    bpm_confidence: Option<f64>,
+    bpm_corrected: bool,
+    musical_key: Option<String>,
+    key_confidence: Option<f64>,
+    key_corrected: bool,
+    waveform_available: bool,
+    beat_grid_available: bool,
 }
 
-impl From<TrackRecord> for TrackView {
-    fn from(track: TrackRecord) -> Self {
+impl TrackView {
+    fn new(track: TrackRecord, analysis: EffectiveAnalysisRecord) -> Self {
         let title = track.title.unwrap_or_else(|| title_from_path(&track.path));
         let duration_seconds = track
             .duration_frames
@@ -94,8 +115,82 @@ impl From<TrackRecord> for TrackView {
             duration_seconds,
             codec: track.codec,
             missing: track.missing,
+            analysis_status: analysis.generated.as_ref().map(|value| value.status.clone()),
+            analysis_error: analysis
+                .generated
+                .as_ref()
+                .and_then(|value| value.error_message.clone()),
+            bpm: analysis.bpm,
+            bpm_confidence: analysis.bpm_confidence,
+            bpm_corrected: analysis.bpm_corrected,
+            musical_key: analysis.musical_key,
+            key_confidence: analysis.key_confidence,
+            key_corrected: analysis.key_corrected,
+            waveform_available: analysis
+                .generated
+                .as_ref()
+                .and_then(|value| value.waveform_path.as_ref())
+                .is_some(),
+            beat_grid_available: analysis
+                .generated
+                .as_ref()
+                .and_then(|value| value.beat_grid_path.as_ref())
+                .is_some(),
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalysisJobView {
+    track_id: i64,
+    stage: &'static str,
+    completed_fraction: Option<f32>,
+    queue_position: Option<usize>,
+    message: Option<String>,
+}
+
+impl From<AnalysisJobSnapshot> for AnalysisJobView {
+    fn from(snapshot: AnalysisJobSnapshot) -> Self {
+        Self {
+            track_id: snapshot.track_id,
+            stage: analysis_stage(snapshot.stage),
+            completed_fraction: snapshot.completed_fraction,
+            queue_position: snapshot.queue_position,
+            message: snapshot.message,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalyzeAllResult {
+    queued: usize,
+    already_queued: usize,
+    current: usize,
+    missing: usize,
+    unreadable: usize,
+    queue_full: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BeatView {
+    source_frame: u64,
+    strength: f32,
+    downbeat: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalysisArtifactsView {
+    waveform_bucket_frames: Option<u32>,
+    waveform_overview: Vec<f32>,
+    source_sample_rate: Option<u32>,
+    source_frames: Option<u64>,
+    beat_grid_bpm: Option<f64>,
+    beat_grid_confidence: Option<f32>,
+    beats: Vec<BeatView>,
 }
 
 #[derive(Serialize)]
@@ -296,10 +391,258 @@ async fn scan_music_folder(
 
 #[tauri::command]
 fn library_tracks(state: tauri::State<'_, AppState>) -> Result<Vec<TrackView>, String> {
+    let tracks = state.persistence.tracks().map_err(|error| error.to_string())?;
+    tracks
+        .into_iter()
+        .map(|track| {
+            let analysis = state
+                .persistence
+                .effective_analysis(track.id)
+                .map_err(|error| error.to_string())?;
+            Ok(TrackView::new(track, analysis))
+        })
+        .collect()
+}
+
+fn analysis_stage(stage: AnalysisStage) -> &'static str {
+    match stage {
+        AnalysisStage::Queued => "queued",
+        AnalysisStage::Decoding => "decoding",
+        AnalysisStage::Waveform => "waveform",
+        AnalysisStage::Rhythm => "rhythm",
+        AnalysisStage::Key => "key",
+        AnalysisStage::Loudness => "loudness",
+        AnalysisStage::Writing => "writing",
+        AnalysisStage::Complete => "complete",
+        AnalysisStage::Failed => "failed",
+        AnalysisStage::Cancelled => "cancelled",
+    }
+}
+
+fn analysis_identity(track_id: i64, persistence: &PersistenceWorker) -> Result<TrackIdentity, String> {
+    let track = persistence
+        .track(track_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "track is not indexed in the local library".to_string())?;
+    if track.missing {
+        return Err("track is marked missing; rescan its folder before analysis".to_string());
+    }
+    let path = PathBuf::from(&track.path);
+    let metadata = fs::metadata(&path).map_err(|error| format!("cannot read track: {error}"))?;
+    let modified_at_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    Ok(TrackIdentity {
+        track_id,
+        path,
+        file_size: metadata.len(),
+        modified_at_ms,
+        content_fingerprint: None,
+    })
+}
+
+#[tauri::command]
+fn analysis_analyze_track(
+    track_id: i64,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .analysis
+        .enqueue(analysis_identity(track_id, &state.persistence)?)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn analysis_analyze_all(state: tauri::State<'_, AppState>) -> Result<AnalyzeAllResult, String> {
+    let mut result = AnalyzeAllResult {
+        queued: 0,
+        already_queued: 0,
+        current: 0,
+        missing: 0,
+        unreadable: 0,
+        queue_full: false,
+    };
+    for track in state.persistence.tracks().map_err(|error| error.to_string())? {
+        if track.missing {
+            result.missing += 1;
+            continue;
+        }
+        let identity = match analysis_identity(track.id, &state.persistence) {
+            Ok(identity) => identity,
+            Err(_) => {
+                result.unreadable += 1;
+                continue;
+            }
+        };
+        if analysis_is_current(&identity, &state.persistence)? {
+            result.current += 1;
+            continue;
+        }
+        match state.analysis.enqueue(identity) {
+            Ok(()) => result.queued += 1,
+            Err(AnalysisServiceError::AlreadyQueued) => {
+                result.already_queued += 1;
+            }
+            Err(AnalysisServiceError::QueueFull) => {
+                result.queue_full = true;
+                break;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(result)
+}
+
+fn analysis_is_current(
+    identity: &TrackIdentity,
+    persistence: &PersistenceWorker,
+) -> Result<bool, String> {
+    let Some(analysis) = persistence
+        .analysis(identity.track_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
+    };
+    if analysis.status != "complete" || analysis.analysis_version != i64::from(ANALYSIS_VERSION) {
+        return Ok(false);
+    }
+    let digest = identity_digest(identity);
+    let Some(path) = analysis.waveform_path else {
+        return Ok(false);
+    };
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(false),
+    };
+    let cache = match WaveformCache::decode(&bytes) {
+        Ok(cache) => cache,
+        Err(_) => return Ok(false),
+    };
+    if cache.identity_digest != digest {
+        return Ok(false);
+    }
+    if let Some(path) = analysis.beat_grid_path {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(false),
+        };
+        let grid = match BeatGridCache::decode(&bytes) {
+            Ok(grid) => grid,
+            Err(_) => return Ok(false),
+        };
+        if grid.identity_digest != digest {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[tauri::command]
+fn analysis_cancel_track(
+    track_id: i64,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    state.analysis.cancel(track_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn analysis_jobs(state: tauri::State<'_, AppState>) -> Result<Vec<AnalysisJobView>, String> {
+    state
+        .analysis
+        .snapshots()
+        .map(|snapshots| snapshots.into_iter().map(AnalysisJobView::from).collect())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn analysis_set_correction(
+    track_id: i64,
+    bpm: Option<f64>,
+    musical_key: Option<String>,
+    beat_grid_offset_frames: Option<i64>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
     state
         .persistence
-        .tracks()
-        .map(|tracks| tracks.into_iter().map(TrackView::from).collect())
+        .save_track_correction(TrackCorrectionRecord {
+            track_id,
+            bpm,
+            musical_key,
+            beat_grid_offset_frames,
+            updated_at_ms: now_ms()?,
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn analysis_artifacts(
+    track_id: i64,
+    state: tauri::State<'_, AppState>,
+) -> Result<AnalysisArtifactsView, String> {
+    let identity = analysis_identity(track_id, &state.persistence)?;
+    let digest = identity_digest(&identity);
+    let analysis = state
+        .persistence
+        .analysis(track_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "track has no analysis result".to_string())?;
+    let waveform = analysis
+        .waveform_path
+        .map(|path| fs::read(path).map_err(|error| error.to_string()))
+        .transpose()?
+        .map(|bytes| WaveformCache::decode(&bytes).map_err(|error| error.to_string()))
+        .transpose()?;
+    let grid = analysis
+        .beat_grid_path
+        .map(|path| fs::read(path).map_err(|error| error.to_string()))
+        .transpose()?
+        .map(|bytes| BeatGridCache::decode(&bytes).map_err(|error| error.to_string()))
+        .transpose()?;
+    if waveform.as_ref().is_some_and(|cache| cache.identity_digest != digest)
+        || grid.as_ref().is_some_and(|cache| cache.identity_digest != digest)
+    {
+        return Err("analysis cache does not match the current track identity".to_string());
+    }
+    let overview = waveform
+        .as_ref()
+        .and_then(|cache| cache.levels.last())
+        .map(|level| (level.bucket_frames, level.values.clone()));
+    Ok(AnalysisArtifactsView {
+        waveform_bucket_frames: overview.as_ref().map(|value| value.0),
+        waveform_overview: overview.map(|value| value.1).unwrap_or_default(),
+        source_sample_rate: waveform
+            .as_ref()
+            .map(|cache| cache.source_sample_rate)
+            .or_else(|| grid.as_ref().map(|cache| cache.source_sample_rate)),
+        source_frames: waveform
+            .as_ref()
+            .map(|cache| cache.source_frames)
+            .or_else(|| grid.as_ref().map(|cache| cache.source_frames)),
+        beat_grid_bpm: grid.as_ref().map(|cache| cache.bpm),
+        beat_grid_confidence: grid.as_ref().map(|cache| cache.confidence),
+        beats: grid
+            .map(|cache| {
+                cache
+                    .beats
+                    .into_iter()
+                    .map(|beat| BeatView {
+                        source_frame: beat.source_frame,
+                        strength: beat.strength,
+                        downbeat: beat.downbeat,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+fn now_ms() -> Result<i64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .map_err(|error| error.to_string())
 }
 
@@ -701,7 +1044,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
+            let app_cache_dir = app.path().app_cache_dir()?;
             fs::create_dir_all(&app_data_dir)?;
+            fs::create_dir_all(&app_cache_dir)?;
             let persistence = PersistenceWorker::start(app_data_dir.join("djapp.sqlite"))?;
             let preferred_output_device = persistence
                 .setting(OUTPUT_DEVICE_SETTING.to_string())
@@ -732,9 +1077,16 @@ pub fn run() {
                 routing_preferences,
             )
             .map_err(std::io::Error::other)?;
+            let persistence = Arc::new(persistence);
+            let analysis = AnalysisService::start(
+                Arc::clone(&persistence),
+                WaveformLoudnessProcessor::new(app_cache_dir.join("analysis")),
+            )
+            .map_err(std::io::Error::other)?;
             app.manage(AppState {
-                persistence: Arc::new(persistence),
+                persistence,
                 mixer: Arc::new(mixer),
+                analysis: Arc::new(analysis),
             });
             Ok(())
         })
@@ -742,6 +1094,12 @@ pub fn run() {
             engine_status,
             scan_music_folder,
             library_tracks,
+            analysis_analyze_track,
+            analysis_analyze_all,
+            analysis_cancel_track,
+            analysis_jobs,
+            analysis_set_correction,
+            analysis_artifacts,
             audio_output_devices,
             audio_select_output_device,
             audio_select_cue_output_device,
@@ -812,4 +1170,92 @@ fn setting_u32(
         .map_err(std::io::Error::other)?
         .and_then(|value| value.parse().ok())
         .unwrap_or(fallback))
+}
+
+#[cfg(test)]
+mod analysis_tests {
+    use super::*;
+    use djapp_audio_spike::{
+        analysis::cache::{WaveformCache, WaveformLevel},
+        persistence::{AnalysisRecord, NewTrack},
+    };
+
+    #[test]
+    fn current_analysis_requires_matching_source_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "djapp-tauri-analysis-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("track.raw");
+        fs::write(&source, [1_u8, 2, 3, 4]).unwrap();
+        let metadata = fs::metadata(&source).unwrap();
+        let modified_at_ms = metadata
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let persistence = PersistenceWorker::start(root.join("library.sqlite")).unwrap();
+        let track_id = persistence
+            .upsert_track(NewTrack {
+                library_root_id: None,
+                path: source.to_string_lossy().into_owned(),
+                file_size: metadata.len() as i64,
+                modified_at_ms,
+                content_fingerprint: None,
+                title: Some("Track".to_string()),
+                artist: None,
+                album: None,
+                genre: None,
+                duration_frames: Some(4),
+                sample_rate: Some(44_100),
+                channels: Some(1),
+                codec: Some("raw".to_string()),
+                missing: false,
+                updated_at_ms: modified_at_ms,
+            })
+            .unwrap()
+            .id;
+        let identity = analysis_identity(track_id, &persistence).unwrap();
+        let waveform_path = root.join("track.waveform");
+        let waveform = WaveformCache {
+            identity_digest: identity_digest(&identity),
+            source_sample_rate: 44_100,
+            source_channels: 1,
+            source_frames: 4,
+            levels: vec![WaveformLevel {
+                bucket_frames: 256,
+                values: vec![-0.5, 0.5, 0.25],
+            }],
+        };
+        fs::write(&waveform_path, waveform.encode().unwrap()).unwrap();
+        persistence
+            .save_analysis(AnalysisRecord {
+                track_id,
+                analysis_version: i64::from(ANALYSIS_VERSION),
+                status: "complete".to_string(),
+                bpm: None,
+                bpm_confidence: None,
+                musical_key: None,
+                key_confidence: None,
+                integrated_lufs: None,
+                true_peak_db: None,
+                beat_grid_path: None,
+                waveform_path: Some(waveform_path.to_string_lossy().into_owned()),
+                error_message: None,
+                analyzed_at_ms: Some(modified_at_ms),
+            })
+            .unwrap();
+        assert!(analysis_is_current(&identity, &persistence).unwrap());
+        fs::write(&source, [1_u8, 2, 3, 4, 5]).unwrap();
+        let changed = analysis_identity(track_id, &persistence).unwrap();
+        assert!(!analysis_is_current(&changed, &persistence).unwrap());
+        persistence.shutdown().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 }

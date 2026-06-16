@@ -101,6 +101,7 @@ CREATE TABLE queue_items (
 #[derive(Debug)]
 pub enum PersistenceError {
     Database(rusqlite::Error),
+    InvalidData(&'static str),
     UnsupportedSchema(i64),
     WorkerUnavailable,
     WorkerPanicked,
@@ -110,6 +111,7 @@ impl std::fmt::Display for PersistenceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Database(error) => write!(formatter, "database error: {error}"),
+            Self::InvalidData(message) => formatter.write_str(message),
             Self::UnsupportedSchema(version) => write!(
                 formatter,
                 "database schema version {version} is newer than supported version {SCHEMA_VERSION}"
@@ -178,6 +180,27 @@ pub struct AnalysisRecord {
     pub waveform_path: Option<String>,
     pub error_message: Option<String>,
     pub analyzed_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackCorrectionRecord {
+    pub track_id: i64,
+    pub bpm: Option<f64>,
+    pub musical_key: Option<String>,
+    pub beat_grid_offset_frames: Option<i64>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectiveAnalysisRecord {
+    pub generated: Option<AnalysisRecord>,
+    pub bpm: Option<f64>,
+    pub bpm_confidence: Option<f64>,
+    pub bpm_corrected: bool,
+    pub musical_key: Option<String>,
+    pub key_confidence: Option<f64>,
+    pub key_corrected: bool,
+    pub beat_grid_offset_frames: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -492,6 +515,117 @@ impl Persistence {
         Ok(())
     }
 
+    pub fn analysis(&self, track_id: i64) -> Result<Option<AnalysisRecord>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT track_id, analysis_version, status, bpm, bpm_confidence,
+                 musical_key, key_confidence, integrated_lufs, true_peak_db,
+                 beat_grid_path, waveform_path, error_message, analyzed_at_ms
+                 FROM track_analysis WHERE track_id=?1",
+                [track_id],
+                |row| {
+                    Ok(AnalysisRecord {
+                        track_id: row.get(0)?,
+                        analysis_version: row.get(1)?,
+                        status: row.get(2)?,
+                        bpm: row.get(3)?,
+                        bpm_confidence: row.get(4)?,
+                        musical_key: row.get(5)?,
+                        key_confidence: row.get(6)?,
+                        integrated_lufs: row.get(7)?,
+                        true_peak_db: row.get(8)?,
+                        beat_grid_path: row.get(9)?,
+                        waveform_path: row.get(10)?,
+                        error_message: row.get(11)?,
+                        analyzed_at_ms: row.get(12)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn save_track_correction(&mut self, correction: &TrackCorrectionRecord) -> Result<()> {
+        if correction
+            .bpm
+            .is_some_and(|bpm| !bpm.is_finite() || bpm <= 0.0)
+        {
+            return Err(PersistenceError::InvalidData(
+                "corrected BPM must be positive and finite",
+            ));
+        }
+        if correction
+            .musical_key
+            .as_deref()
+            .is_some_and(|key| !valid_musical_key(key))
+        {
+            return Err(PersistenceError::InvalidData(
+                "corrected musical key is invalid",
+            ));
+        }
+        self.connection.execute(
+            "INSERT INTO track_corrections(track_id, bpm, musical_key,
+             beat_grid_offset_frames, updated_at_ms) VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(track_id) DO UPDATE SET bpm=excluded.bpm,
+             musical_key=excluded.musical_key,
+             beat_grid_offset_frames=excluded.beat_grid_offset_frames,
+             updated_at_ms=excluded.updated_at_ms",
+            params![
+                correction.track_id,
+                correction.bpm,
+                correction.musical_key,
+                correction.beat_grid_offset_frames,
+                correction.updated_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn effective_analysis(&self, track_id: i64) -> Result<EffectiveAnalysisRecord> {
+        let generated = self.analysis(track_id)?;
+        let correction = self
+            .connection
+            .query_row(
+                "SELECT track_id, bpm, musical_key, beat_grid_offset_frames, updated_at_ms
+                 FROM track_corrections WHERE track_id=?1",
+                [track_id],
+                |row| {
+                    Ok(TrackCorrectionRecord {
+                        track_id: row.get(0)?,
+                        bpm: row.get(1)?,
+                        musical_key: row.get(2)?,
+                        beat_grid_offset_frames: row.get(3)?,
+                        updated_at_ms: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        let corrected_bpm = correction.as_ref().and_then(|value| value.bpm);
+        let corrected_key = correction
+            .as_ref()
+            .and_then(|value| value.musical_key.clone());
+        Ok(EffectiveAnalysisRecord {
+            bpm: corrected_bpm.or_else(|| generated.as_ref().and_then(|value| value.bpm)),
+            bpm_confidence: corrected_bpm
+                .is_none()
+                .then(|| generated.as_ref().and_then(|value| value.bpm_confidence))
+                .flatten(),
+            bpm_corrected: corrected_bpm.is_some(),
+            musical_key: corrected_key.clone().or_else(|| {
+                generated
+                    .as_ref()
+                    .and_then(|value| value.musical_key.clone())
+            }),
+            key_confidence: corrected_key
+                .is_none()
+                .then(|| generated.as_ref().and_then(|value| value.key_confidence))
+                .flatten(),
+            key_corrected: corrected_key.is_some(),
+            beat_grid_offset_frames: correction.and_then(|value| value.beat_grid_offset_frames),
+            generated,
+        })
+    }
+
     pub fn replace_queue(&mut self, track_ids: &[i64], added_at_ms: i64) -> Result<()> {
         let transaction = self.connection.transaction()?;
         transaction.execute("DELETE FROM queue_items", [])?;
@@ -514,6 +648,16 @@ impl Persistence {
         let rows = statement.query_map([], |row| row.get(0))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
+}
+
+fn valid_musical_key(value: &str) -> bool {
+    let Some((pitch_class, mode)) = value.split_once(':') else {
+        return false;
+    };
+    pitch_class
+        .parse::<u8>()
+        .is_ok_and(|pitch_class| pitch_class < 12)
+        && matches!(mode, "major" | "minor")
 }
 
 fn migrate(connection: &mut Connection) -> Result<()> {
@@ -582,6 +726,18 @@ enum Command {
     SaveAnalysis {
         analysis: Box<AnalysisRecord>,
         response: Response<()>,
+    },
+    GetAnalysis {
+        track_id: i64,
+        response: Response<Option<AnalysisRecord>>,
+    },
+    SaveTrackCorrection {
+        correction: Box<TrackCorrectionRecord>,
+        response: Response<()>,
+    },
+    GetEffectiveAnalysis {
+        track_id: i64,
+        response: Response<EffectiveAnalysisRecord>,
     },
     ReplaceQueue {
         track_ids: Vec<i64>,
@@ -699,6 +855,21 @@ impl PersistenceWorker {
         })
     }
 
+    pub fn analysis(&self, track_id: i64) -> Result<Option<AnalysisRecord>> {
+        self.request(|response| Command::GetAnalysis { track_id, response })
+    }
+
+    pub fn save_track_correction(&self, correction: TrackCorrectionRecord) -> Result<()> {
+        self.request(|response| Command::SaveTrackCorrection {
+            correction: Box::new(correction),
+            response,
+        })
+    }
+
+    pub fn effective_analysis(&self, track_id: i64) -> Result<EffectiveAnalysisRecord> {
+        self.request(|response| Command::GetEffectiveAnalysis { track_id, response })
+    }
+
     pub fn replace_queue(&self, track_ids: Vec<i64>, added_at_ms: i64) -> Result<()> {
         self.request(|response| Command::ReplaceQueue {
             track_ids,
@@ -799,6 +970,18 @@ fn run_worker(mut database: Persistence, receiver: Receiver<Command>) {
             }
             Command::SaveAnalysis { analysis, response } => {
                 let _ = response.send(database.save_analysis(analysis.as_ref()));
+            }
+            Command::GetAnalysis { track_id, response } => {
+                let _ = response.send(database.analysis(track_id));
+            }
+            Command::SaveTrackCorrection {
+                correction,
+                response,
+            } => {
+                let _ = response.send(database.save_track_correction(correction.as_ref()));
+            }
+            Command::GetEffectiveAnalysis { track_id, response } => {
+                let _ = response.send(database.effective_analysis(track_id));
             }
             Command::ReplaceQueue {
                 track_ids,
@@ -1011,5 +1194,75 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 0);
         }
+    }
+
+    #[test]
+    fn effective_analysis_prefers_manual_corrections_without_overwriting_generated_values() {
+        let mut database = Persistence::open_in_memory().unwrap();
+        let track_id = database
+            .upsert_track(&track("/music/key.wav", None))
+            .unwrap()
+            .id;
+        let generated = AnalysisRecord {
+            track_id,
+            analysis_version: 1,
+            status: "complete".to_string(),
+            bpm: Some(120.0),
+            bpm_confidence: Some(0.8),
+            musical_key: Some("0:major".to_string()),
+            key_confidence: Some(0.7),
+            integrated_lufs: None,
+            true_peak_db: None,
+            beat_grid_path: Some("grid".to_string()),
+            waveform_path: Some("wave".to_string()),
+            error_message: None,
+            analyzed_at_ms: Some(1),
+        };
+        database.save_analysis(&generated).unwrap();
+        database
+            .save_track_correction(&TrackCorrectionRecord {
+                track_id,
+                bpm: Some(121.5),
+                musical_key: Some("9:minor".to_string()),
+                beat_grid_offset_frames: Some(256),
+                updated_at_ms: 2,
+            })
+            .unwrap();
+
+        let effective = database.effective_analysis(track_id).unwrap();
+        assert_eq!(effective.bpm, Some(121.5));
+        assert_eq!(effective.bpm_confidence, None);
+        assert!(effective.bpm_corrected);
+        assert_eq!(effective.musical_key.as_deref(), Some("9:minor"));
+        assert_eq!(effective.key_confidence, None);
+        assert!(effective.key_corrected);
+        assert_eq!(effective.beat_grid_offset_frames, Some(256));
+        assert_eq!(effective.generated, Some(generated));
+    }
+
+    #[test]
+    fn correction_validation_rejects_invalid_bpm_and_key() {
+        let mut database = Persistence::open_in_memory().unwrap();
+        let track_id = database
+            .upsert_track(&track("/music/invalid.wav", None))
+            .unwrap()
+            .id;
+        let mut correction = TrackCorrectionRecord {
+            track_id,
+            bpm: Some(f64::NAN),
+            musical_key: None,
+            beat_grid_offset_frames: None,
+            updated_at_ms: 1,
+        };
+        assert!(matches!(
+            database.save_track_correction(&correction),
+            Err(PersistenceError::InvalidData(_))
+        ));
+        correction.bpm = None;
+        correction.musical_key = Some("8A".to_string());
+        assert!(matches!(
+            database.save_track_correction(&correction),
+            Err(PersistenceError::InvalidData(_))
+        ));
     }
 }
